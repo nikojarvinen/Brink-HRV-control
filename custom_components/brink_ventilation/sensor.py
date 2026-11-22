@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 from . import BrinkConfigEntry
 from .const import (
@@ -297,12 +299,26 @@ class BrinkHomeSensorEntity(BrinkHomeDeviceEntity, SensorEntity):
             return None
 
         if self._enum_map is not None:
-            return self._enum_map.get(str(value), str(value))
+            mapped = self._enum_map.get(str(value))
+            if mapped is None:
+                _LOGGER.debug(
+                    "Unknown value %r for enum sensor %s", value, self.entity_description.key
+                )
+            return mapped
 
         try:
-            return float(value)
+            number = float(value)
         except (ValueError, TypeError):
-            return value
+            _LOGGER.debug(
+                "Non-numeric value %r for sensor %s", value, self.entity_description.key
+            )
+            return None
+        if not math.isfinite(number):
+            _LOGGER.debug(
+                "Non-finite value %r for sensor %s", value, self.entity_description.key
+            )
+            return None
+        return number
 
 
 class BrinkExtraVentRemainingEntity(BrinkHomeDeviceEntity, SensorEntity):
@@ -498,6 +514,9 @@ class BrinkConnectionStatusEntity(BrinkHomeDeviceEntity, SensorEntity):
         return attrs
 
 
+_TEMPERATURE_UNITS = set(TemperatureConverter.VALID_UNITS)
+
+
 class BrinkHeatRecoveryEfficiencyEntity(BrinkHomeDeviceEntity, SensorEntity):
     """Sensor showing heat recovery efficiency (0-100%).
 
@@ -549,9 +568,17 @@ class BrinkHeatRecoveryEfficiencyEntity(BrinkHomeDeviceEntity, SensorEntity):
             if state is None or state.state in (None, "unavailable", "unknown"):
                 continue
             try:
-                values.append(float(state.state))
+                value = float(state.state)
             except (ValueError, TypeError):
                 continue
+            if not math.isfinite(value):
+                continue
+            unit = state.attributes.get("unit_of_measurement")
+            if unit in _TEMPERATURE_UNITS and unit != UnitOfTemperature.CELSIUS:
+                value = TemperatureConverter.convert(
+                    value, unit, UnitOfTemperature.CELSIUS
+                )
+            values.append(value)
 
         if not values:
             return None
@@ -572,6 +599,8 @@ class BrinkHeatRecoveryEfficiencyEntity(BrinkHomeDeviceEntity, SensorEntity):
             t_fresh = float(fresh_param.get("value"))
         except (ValueError, TypeError):
             return None
+        if not math.isfinite(t_fresh):
+            return None
 
         # Get T_supply from coordinator data
         supply_param = self._get_param_any_component(PARAM_SUPPLY_TEMP)
@@ -580,6 +609,8 @@ class BrinkHeatRecoveryEfficiencyEntity(BrinkHomeDeviceEntity, SensorEntity):
         try:
             t_supply = float(supply_param.get("value"))
         except (ValueError, TypeError):
+            return None
+        if not math.isfinite(t_supply):
             return None
 
         # Check bypass valve status — if open, no heat recovery

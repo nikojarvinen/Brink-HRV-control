@@ -210,3 +210,21 @@ async def test_switch_turn_off_error(hass: HomeAssistant, setup_integration) -> 
                 {"entity_id": entity_id},
                 blocking=True,
             )
+
+
+async def test_deactivate_updates_switch_immediately(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """Deactivating the controller refreshes the switch without waiting for a poll."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_extra_ventilation")
+    controller = setup_integration.runtime_data.coordinator.automation_controller
+
+    await controller.async_activate_extra_ventilation()
+    state = hass.states.get(entity_id)
+    assert state is not None and state.state == "on"
+
+    await controller.async_deactivate()
+
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.state == "off"

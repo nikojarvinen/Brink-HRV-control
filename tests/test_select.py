@@ -263,3 +263,218 @@ async def test_expedited_polling_triggered(
         )
 
         mock_expedited.assert_called_once()
+
+
+async def test_current_option_not_adaptive_during_boost_started_while_off(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """A manual boost with adaptive off must not display 'adaptive'."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_ventilation_level")
+    coordinator = setup_integration.runtime_data.coordinator
+    controller = coordinator.automation_controller
+
+    await controller.async_activate_extra_ventilation()
+    try:
+        assert controller.state == AutomationState.BOOSTED
+        assert controller.adaptive_active is False
+        state = hass.states.get(entity_id)
+        assert state is not None
+        # Falls back to the API-reported level (mock data: level 2)
+        assert state.state == "level_2"
+    finally:
+        await controller.async_deactivate()
+
+
+async def test_current_option_adaptive_during_boost_started_from_adaptive(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """A boost during adaptive mode still shows 'adaptive'."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_ventilation_level")
+    coordinator = setup_integration.runtime_data.coordinator
+    controller = coordinator.automation_controller
+
+    await controller.async_activate()
+    await controller.async_activate_extra_ventilation()
+    try:
+        assert controller.state == AutomationState.BOOSTED
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == "adaptive"
+    finally:
+        await controller.async_deactivate()
+
+
+async def test_level_select_validation_failure_keeps_adaptive_active(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """If validation fails, adaptive mode must not have been deactivated."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_ventilation_level")
+    coordinator = setup_integration.runtime_data.coordinator
+    controller = coordinator.automation_controller
+
+    await controller.async_activate()
+    assert controller.state == AutomationState.BASE
+    coordinator.client.write_parameters.reset_mock()
+
+    # Make the level parameter read-only (no value_id)
+    params = coordinator.data[SYSTEM_ID]["components"][0]["parameters"]
+    params[PARAM_VENTILATION_LEVEL]["value_id"] = None
+
+    try:
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                "select",
+                "select_option",
+                {"entity_id": entity_id, "option": "level_1"},
+                blocking=True,
+            )
+
+        assert controller.state == AutomationState.BASE
+        coordinator.client.write_parameters.assert_not_called()
+    finally:
+        await controller.async_deactivate()
+
+
+async def test_level_select_during_idle_boost_wins_over_restore(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """Picking a level during a boost started while off does not restore the old state."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_ventilation_level")
+    coordinator = setup_integration.runtime_data.coordinator
+    controller = coordinator.automation_controller
+
+    await controller.async_activate_extra_ventilation()
+    assert controller.state == AutomationState.BOOSTED
+    assert controller._pre_boost_snapshot is not None
+    coordinator.client.write_parameters.reset_mock()
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": entity_id, "option": "level_0"},
+        blocking=True,
+    )
+
+    assert controller.state == AutomationState.IDLE
+    assert controller._pre_boost_snapshot is None
+    # Exactly one write: the user's choice (mode manual + level 0), no restore
+    coordinator.client.write_parameters.assert_called_once()
+    params_arg = coordinator.client.write_parameters.call_args[0][1]
+    assert (1002, "1") in params_arg
+    assert (1001, "0") in params_arg
+
+
+def _queue_idle_restore(controller, expected=(1, 3)) -> None:
+    """Simulate a failed IDLE boost restore waiting for the next poll."""
+    assert controller.state == AutomationState.IDLE
+    controller._pending_writes = [(1002, "1"), (1001, "1")]
+    controller._pending_restore_expected = expected
+    assert controller.has_pending_writes
+
+
+async def test_mode_select_drops_queued_controller_restore(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """A user mode change must not be overwritten by a queued boost restore."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_mode")
+    controller = setup_integration.runtime_data.coordinator.automation_controller
+    _queue_idle_restore(controller)
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": entity_id, "option": "holiday"},
+        blocking=True,
+    )
+
+    assert not controller.has_pending_writes
+
+
+async def test_level_select_drops_queued_controller_restore(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """A user level change must not be overwritten by a queued boost restore."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_ventilation_level")
+    controller = setup_integration.runtime_data.coordinator.automation_controller
+    _queue_idle_restore(controller)
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": entity_id, "option": "level_0"},
+        blocking=True,
+    )
+
+    assert not controller.has_pending_writes
+
+
+async def test_bypass_select_keeps_queued_controller_restore(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """Bypass is unrelated to the restore and must not drop it."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_bypass_operation")
+    controller = setup_integration.runtime_data.coordinator.automation_controller
+    # Expect the values the mocked device really reports (manual, level 2) so the
+    # poll triggered by the write does not drop the restore for another reason
+    _queue_idle_restore(controller, expected=(1, 2))
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": entity_id, "option": BYPASS_OPERATION_MAP["1"]},
+        blocking=True,
+    )
+
+    # Not dropped: the poll after the write replayed the restore
+    coordinator = setup_integration.runtime_data.coordinator
+    written = [c.args[1] for c in coordinator.client.write_parameters.await_args_list]
+    assert [(1002, "1"), (1001, "1")] in written
+
+
+async def test_mode_select_during_idle_boost_ends_it_without_restore(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """An explicit mode choice ends a boost started while adaptive was off."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_mode")
+    coordinator = setup_integration.runtime_data.coordinator
+    controller = coordinator.automation_controller
+
+    await controller.async_activate_extra_ventilation()
+    assert controller.state == AutomationState.BOOSTED
+    assert controller.adaptive_active is False
+    coordinator.client.write_parameters.reset_mock()
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": entity_id, "option": "holiday"},
+        blocking=True,
+    )
+
+    assert controller.state == AutomationState.IDLE
+    assert controller._pre_boost_snapshot is None
+    assert controller.boost_remaining_minutes == 0
+    # Only the user's mode write; no restore of the old mode/level
+    coordinator.client.write_parameters.assert_called_once()
+
+
+async def test_mode_select_during_adaptive_boost_keeps_boost(
+    hass: HomeAssistant, setup_integration
+) -> None:
+    """Behavior with adaptive active is unchanged (pending product decision)."""
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_mode")
+    controller = setup_integration.runtime_data.coordinator.automation_controller
+
+    await controller.async_activate()
+    await controller.async_activate_extra_ventilation()
+    assert controller.adaptive_active is True
+    try:
+        await hass.services.async_call(
+            "select",
+            "select_option",
+            {"entity_id": entity_id, "option": "holiday"},
+            blocking=True,
+        )
+        assert controller.state == AutomationState.BOOSTED
+    finally:
+        await controller.async_deactivate()

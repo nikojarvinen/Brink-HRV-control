@@ -124,6 +124,7 @@ PARAM_FRESH_AIR_TEMP: str = _const_mod.PARAM_FRESH_AIR_TEMP  # type: ignore[attr
 
 BrinkAuthError = _cloud_mod.BrinkAuthError  # type: ignore[attr-defined]
 BrinkHomeCloud = _cloud_mod.BrinkHomeCloud  # type: ignore[attr-defined]
+_RefreshTransientError = _cloud_mod._RefreshTransientError  # type: ignore[attr-defined]
 _InputFieldExtractor = _cloud_mod._InputFieldExtractor  # type: ignore[attr-defined]
 _extract_parameters = _cloud_mod._extract_parameters  # type: ignore[attr-defined]
 _is_trusted_url = _cloud_mod._is_trusted_url  # type: ignore[attr-defined]
@@ -1228,17 +1229,32 @@ class TestTokenManagement:
         assert client._refresh_token is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 503])
+    async def test_refresh_rate_limited_or_5xx_is_transient(self, status: int) -> None:
+        """429 / 5xx during refresh -> keeps refresh_token, transient error."""
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "some-refresh"
+        session.post = AsyncMock(
+            return_value=_make_mock_response(status=status, url=OIDC_TOKEN_URL)
+        )
+
+        with pytest.raises(_RefreshTransientError):
+            await client._refresh_access_token()
+        assert client._refresh_token == "some-refresh"
+
+    @pytest.mark.asyncio
     async def test_refresh_access_token_network_error(self) -> None:
-        """Network error during refresh -> clears refresh_token and raises."""
+        """Network error during refresh -> keeps refresh_token, transient error."""
         session = _make_mock_session()
         client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
         client._refresh_token = "some-refresh"
 
         session.post = AsyncMock(side_effect=aiohttp.ClientError("timeout"))
 
-        with pytest.raises(BrinkAuthError, match="Refresh token request failed"):
+        with pytest.raises(_RefreshTransientError, match="Refresh token request failed"):
             await client._refresh_access_token()
-        assert client._refresh_token is None
+        assert client._refresh_token == "some-refresh"
 
     @pytest.mark.asyncio
     async def test_refresh_access_token_missing_access_token(self) -> None:
@@ -2241,3 +2257,1025 @@ class TestBrinkAuthError:
     def test_is_exception_subclass(self) -> None:
         """BrinkAuthError is an Exception."""
         assert issubclass(BrinkAuthError, Exception)
+
+
+# ---------------------------------------------------------------------------
+# Auth locking, token invalidation, expiry handling
+# ---------------------------------------------------------------------------
+
+
+class TestLoginLockAndInvalidate:
+    """Tests for login() locking, async_invalidate_token and write timeout scope."""
+
+    @pytest.mark.asyncio
+    async def test_login_holds_auth_lock_and_resets_backoff(self) -> None:
+        """login() runs _oidc_login under _auth_lock and resets backoff state."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._auth_fail_count = 3
+        client._auth_cooldown_until = 0.0  # elapsed cooldown
+
+        held: list[bool] = []
+
+        async def fake_oidc() -> None:
+            held.append(client._auth_lock.locked())
+
+        with patch.object(client, "_oidc_login", side_effect=fake_oidc):
+            await client.login()
+
+        assert held == [True]
+        assert not client._auth_lock.locked()
+        assert client._auth_fail_count == 0
+        assert client._auth_cooldown_until == 0.0
+
+    @pytest.mark.asyncio
+    async def test_login_failure_keeps_backoff_and_releases_lock(self) -> None:
+        """A failed login() propagates, releases the lock, advances backoff."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._auth_fail_count = 2
+
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock, side_effect=BrinkAuthError("x")
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client.login()
+
+        assert not client._auth_lock.locked()
+        assert client._auth_fail_count == 3
+        assert client._auth_cooldown_until > time.monotonic()
+
+    @pytest.mark.asyncio
+    async def test_login_serialized_with_ensure_token(self) -> None:
+        """login() and _ensure_token never run _oidc_login concurrently."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        running = 0
+        max_running = 0
+
+        async def fake_oidc() -> None:
+            nonlocal running, max_running
+            running += 1
+            max_running = max(max_running, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+        with patch.object(client, "_oidc_login", side_effect=fake_oidc):
+            await asyncio.gather(client.login(), client._ensure_token())
+
+        assert max_running == 1
+
+    @pytest.mark.asyncio
+    async def test_invalidate_token_expires_but_keeps_tokens(self) -> None:
+        """async_invalidate_token zeroes expiry, keeps access/refresh tokens."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        client._token_expiry = time.monotonic() + 3600
+
+        await client.async_invalidate_token()
+
+        assert client._token_expiry == 0.0
+        assert client._access_token == "tok"
+        assert client._refresh_token == "ref"
+        assert not client._auth_lock.locked()
+
+        # _ensure_token now takes the refresh path first
+        with patch.object(
+            client, "_refresh_access_token", new_callable=AsyncMock
+        ) as mock_refresh:
+            async def refreshed() -> None:
+                client._token_expiry = time.monotonic() + 3600
+
+            mock_refresh.side_effect = refreshed
+            await client._ensure_token()
+            mock_refresh.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_write_401_reauth_happens_outside_timeout(self) -> None:
+        """Re-auth after a 401 must not run inside the 20s write timeout."""
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "stale-token"
+        client._token_expiry = time.monotonic() + 3600
+
+        session.put = AsyncMock(
+            side_effect=[_make_mock_response(status=401), _make_mock_response(status=200)]
+        )
+
+        depth = 0
+        depth_during_ensure: list[int] = []
+        depth_during_invalidate: list[int] = []
+        real_timeout = asyncio.timeout
+
+        @contextlib.asynccontextmanager
+        async def counting_timeout(delay: float | None):  # type: ignore[no-untyped-def]
+            nonlocal depth
+            depth += 1
+            try:
+                async with real_timeout(delay):
+                    yield
+            finally:
+                depth -= 1
+
+        async def fake_ensure() -> None:
+            depth_during_ensure.append(depth)
+
+        real_invalidate = client.async_invalidate_token
+
+        async def spy_invalidate(failed_token: str | None = None) -> None:
+            depth_during_invalidate.append(depth)
+            await real_invalidate(failed_token)
+
+        with (
+            patch.object(asyncio, "timeout", counting_timeout),
+            patch.object(client, "_ensure_token", side_effect=fake_ensure),
+            patch.object(client, "async_invalidate_token", side_effect=spy_invalidate),
+        ):
+            await client.write_parameters(SYSTEM_ID, [(1001, "2")])
+
+        assert session.put.call_count == 2
+        # Initial ensure + re-auth after 401, both outside any timeout
+        assert depth_during_ensure == [0, 0]
+        assert depth_during_invalidate == [0]
+
+    @pytest.mark.asyncio
+    async def test_write_401_releases_responses(self) -> None:
+        """Both 401 responses are released and the second raises BrinkAuthError."""
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "stale-token"
+        client._token_expiry = time.monotonic() + 3600
+
+        resp1 = _make_mock_response(status=401)
+        resp2 = _make_mock_response(status=401)
+        session.put = AsyncMock(side_effect=[resp1, resp2])
+
+        with patch.object(client, "_ensure_token", new_callable=AsyncMock):
+            with pytest.raises(BrinkAuthError, match="persistent 401 after re-auth"):
+                await client.write_parameters(SYSTEM_ID, [(1001, "2")])
+
+        resp1.release.assert_awaited()
+        resp2.release.assert_awaited()
+        assert client._token_expiry == 0.0
+
+
+class TestTokenExpiryParsing:
+    """Tests for _set_token_expiry and its use in token flows."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected_in", "expected_margin"),
+        [
+            (3600, 3600, 60),
+            ("3600", 3600, 60),
+            (3600.0, 3600, 60),
+            (None, 3599, 60),
+            ("abc", 3599, 60),
+            ([], 3599, 60),
+            (0, 3599, 60),
+            (-5, 3599, 60),
+            (True, 3599, 60),
+            (30, 30, 15),
+            (1, 1, 0),
+        ],
+    )
+    def test_set_token_expiry(
+        self, raw: Any, expected_in: int, expected_margin: int
+    ) -> None:
+        """Value is coerced; fallback 3599; margin is min(60, n // 2)."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        before = time.monotonic()
+        result = client._set_token_expiry(raw)
+        after = time.monotonic()
+
+        assert result == expected_in
+        assert (
+            before + expected_in - expected_margin
+            <= client._token_expiry
+            <= after + expected_in - expected_margin
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_with_string_expires_in(self) -> None:
+        """A string expires_in in the refresh response no longer raises."""
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "ref"
+        token_json = _make_token_response()
+        token_json["expires_in"] = "7200"
+        session.post = AsyncMock(
+            return_value=_make_mock_response(status=200, json_data=token_json)
+        )
+
+        await client._refresh_access_token()
+
+        assert client._access_token == "test-access-token-abc"
+        assert client._token_expiry > time.monotonic() + 7000
+
+    @pytest.mark.asyncio
+    async def test_exchange_short_expires_in_not_instantly_expired(self) -> None:
+        """expires_in < 60 must leave the token valid for a while (no refresh storm)."""
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        session.post = AsyncMock(
+            return_value=_make_mock_response(
+                status=200, json_data=_make_token_response(expires_in=30)
+            )
+        )
+
+        await client._exchange_code_for_tokens("code", "verifier")
+
+        assert client._token_expiry > time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Redirect parsing / following (additional coverage)
+# ---------------------------------------------------------------------------
+
+
+class TestRedirectHandlingExtra:
+    """Tests for state handling, fragments, and relative Location resolution."""
+
+    def test_no_code_no_state_does_not_warn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Intermediate redirect without code/state returns None silently."""
+        url = "https://www.brink-home.com/idsrv/step1?foo=bar"
+        with caplog.at_level("DEBUG"):
+            code = BrinkHomeCloud._extract_code_from_redirect(
+                url, expected_state="mystate"
+            )
+        assert code is None
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_state_mismatch_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Code with wrong state still logs the CSRF warning and returns None."""
+        url = "https://www.brink-home.com/app/?code=abc&state=wrong"
+        with caplog.at_level("DEBUG"):
+            code = BrinkHomeCloud._extract_code_from_redirect(
+                url, expected_state="mystate"
+            )
+        assert code is None
+        assert any("state mismatch" in r.getMessage() for r in caplog.records)
+
+    def test_fragment_code_and_state_match(self) -> None:
+        """Code and state both from the fragment validate and return the code."""
+        url = "https://www.brink-home.com/app/#code=fragcode&state=mystate"
+        assert (
+            BrinkHomeCloud._extract_code_from_redirect(url, expected_state="mystate")
+            == "fragcode"
+        )
+
+    def test_fragment_code_state_mismatch(self) -> None:
+        """Wrong state in the fragment rejects the fragment code."""
+        url = "https://www.brink-home.com/app/#code=fragcode&state=wrong"
+        assert (
+            BrinkHomeCloud._extract_code_from_redirect(url, expected_state="mystate")
+            is None
+        )
+
+    def test_state_validated_from_same_component_as_code(self) -> None:
+        """A valid state in the query does not validate a fragment code."""
+        url = "https://www.brink-home.com/app/?state=mystate#code=fragcode"
+        assert (
+            BrinkHomeCloud._extract_code_from_redirect(url, expected_state="mystate")
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_follow_redirects_relative_location_resolved_against_request_url(
+        self,
+    ) -> None:
+        """A path-relative Location resolves against the URL that produced it."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        mock_oidc_session = AsyncMock(spec=aiohttp.ClientSession)
+
+        resp_a = _make_mock_response(
+            status=302, headers={"Location": "step2?x=1"}
+        )
+        resp_b = _make_mock_response(
+            status=302,
+            headers={"Location": "/app/?code=goodcode&state=st"},
+        )
+        mock_oidc_session.get = AsyncMock(side_effect=[resp_a, resp_b])
+
+        code = await client._follow_redirects_for_code(
+            mock_oidc_session,
+            "/idsrv/account/step1",
+            "https://www.brink-home.com/idsrv/account/login",
+            expected_state="st",
+        )
+
+        assert code == "goodcode"
+        requested = [c.args[0] for c in mock_oidc_session.get.call_args_list]
+        assert requested == [
+            "https://www.brink-home.com/idsrv/account/step1",
+            "https://www.brink-home.com/idsrv/account/step2?x=1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_follow_redirects_relative_to_untrusted_host_refused(self) -> None:
+        """Scheme-relative Location to another host is refused after resolving."""
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        mock_oidc_session = AsyncMock(spec=aiohttp.ClientSession)
+
+        resp = _make_mock_response(
+            status=302, headers={"Location": "//evil.example.com/x"}
+        )
+        mock_oidc_session.get = AsyncMock(return_value=resp)
+
+        code = await client._follow_redirects_for_code(
+            mock_oidc_session,
+            "https://www.brink-home.com/idsrv/step1",
+            "https://www.brink-home.com/idsrv/login",
+        )
+
+        assert code is None
+        assert mock_oidc_session.get.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Defensive parsing of API responses
+# ---------------------------------------------------------------------------
+
+
+class TestDefensiveResponseParsing:
+    """Tests for non-dict payload handling in get_systems / uidescription."""
+
+    @staticmethod
+    def _client_with_get(payload: Any) -> BrinkHomeCloud:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "valid-token"
+        client._token_expiry = time.monotonic() + 3600
+        resp = _make_mock_response(status=200)
+        resp.json = AsyncMock(return_value=payload)
+        session.get = AsyncMock(return_value=resp)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_get_systems_skips_non_dict_items(self) -> None:
+        """Non-dict items are skipped; valid ones are kept."""
+        client = self._client_with_get(
+            {"items": ["junk", None, 5, {"systemShareId": 7, "systemName": "OK"}]}
+        )
+        systems = await client.get_systems()
+        assert [s["system_id"] for s in systems] == [7]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], None, "text", 42])
+    async def test_get_systems_non_dict_body(self, payload: Any) -> None:
+        """A non-dict body yields no systems instead of AttributeError."""
+        client = self._client_with_get(payload)
+        assert await client.get_systems() == []
+
+    @pytest.mark.asyncio
+    async def test_get_systems_items_not_a_list(self) -> None:
+        """A non-list 'items' value yields no systems."""
+        client = self._client_with_get({"items": {"systemShareId": 1}})
+        assert await client.get_systems() == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], None, "text"])
+    async def test_get_device_data_non_dict_body(self, payload: Any) -> None:
+        """A non-dict uidescription body returns empty components."""
+        client = self._client_with_get(payload)
+        assert await client.get_device_data(SYSTEM_ID) == {"components": []}
+
+    @pytest.mark.parametrize("payload", [[], None, "x", 3])
+    def test_parse_uidescription_non_dict(self, payload: Any) -> None:
+        """_parse_uidescription tolerates non-dict input."""
+        assert BrinkHomeCloud._parse_uidescription(payload) == {"components": []}
+
+    def test_parse_uidescription_skips_non_dict_nav_items(self) -> None:
+        """Non-dict navigation items are skipped."""
+        data = {"root": {"navigationItems": ["bad", None]}}
+        assert BrinkHomeCloud._parse_uidescription(data) == {"components": []}
+
+
+# ---------------------------------------------------------------------------
+# Review-fix round: credential detection, backoff, token race, reads retry,
+# token JSON validation, refresh token retention, close race, HTTP 308
+# ---------------------------------------------------------------------------
+
+
+def _login_patches(client: BrinkHomeCloud, oidc_session: Any, state: str = "st"):
+    """Context managers patching the OIDC session/jar/PKCE for client.login()."""
+    return (
+        patch(
+            "custom_components.brink_ventilation.core.brink_home_cloud.aiohttp.ClientSession",
+            return_value=oidc_session,
+        ),
+        patch(
+            "custom_components.brink_ventilation.core.brink_home_cloud.aiohttp.CookieJar",
+        ),
+        patch.object(
+            client,
+            "_build_pkce_challenge",
+            return_value=("verifier", "challenge", state, "nonce"),
+        ),
+    )
+
+
+def _oidc_session_mock(post_resp: Any) -> MagicMock:
+    sess = MagicMock(spec=aiohttp.ClientSession)
+    sess.__aenter__ = AsyncMock(return_value=sess)
+    sess.__aexit__ = AsyncMock(return_value=False)
+    sess.get = AsyncMock(
+        return_value=_make_mock_response(status=200, text=LOGIN_PAGE_HTML)
+    )
+    sess.post = AsyncMock(return_value=post_resp)
+    return sess
+
+
+def _client_error_404() -> aiohttp.ClientResponseError:
+    return aiohttp.ClientResponseError(
+        request_info=MagicMock(), history=(), status=404, message="nf"
+    )
+
+
+class TestCredentialDetection200:
+    """A 200 login response that re-displays the login form is a credentials error."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '<form><input name="Username" type="text"/><input name="__RequestVerificationToken" type="hidden" value="x"/></form>',
+            '<form><input name="Password" type="password"/></form>',
+            '<form><input type="PASSWORD" name="pw"></form>',
+        ],
+    )
+    async def test_login_form_redisplayed_is_credentials_error(self, body: str) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(status=200, text=body)
+        oidc = _oidc_session_mock(resp)
+        p1, p2, p3 = _login_patches(client, oidc)
+        with p1, p2, p3:
+            with pytest.raises(BrinkAuthError) as exc_info:
+                await client.login()
+        assert exc_info.value.is_credentials_error is True
+
+    @pytest.mark.asyncio
+    async def test_interstitial_with_only_csrf_token_is_not_credentials_error(self) -> None:
+        """Consent/MFA/terms pages carry the anti-forgery token but no login inputs."""
+        body = (
+            '<form><input name="__RequestVerificationToken" type="hidden" value="x"/>'
+            '<input name="Code" type="text"/><button>Continue</button></form>'
+        )
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(status=200, text=body)
+        oidc = _oidc_session_mock(resp)
+        p1, p2, p3 = _login_patches(client, oidc)
+        with p1, p2, p3:
+            with pytest.raises(BrinkAuthError) as exc_info:
+                await client.login()
+        assert exc_info.value.is_credentials_error is False
+
+    @pytest.mark.asyncio
+    async def test_unrelated_200_stays_non_credentials(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(status=200, text="<html>Welcome</html>")
+        oidc = _oidc_session_mock(resp)
+        p1, p2, p3 = _login_patches(client, oidc)
+        with p1, p2, p3:
+            with pytest.raises(BrinkAuthError) as exc_info:
+                await client.login()
+        assert exc_info.value.is_credentials_error is False
+
+    @pytest.mark.asyncio
+    async def test_empty_credentials_not_posted(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), "", "")
+        oidc = MagicMock(spec=aiohttp.ClientSession)
+        oidc.post = AsyncMock()
+        with pytest.raises(BrinkAuthError) as exc_info:
+            await client._submit_login_credentials(oidc, "https://www.brink-home.com/l", "c", None, "s")
+        assert exc_info.value.is_credentials_error is False
+        oidc.post.assert_not_called()
+
+
+class TestLoginBackoff:
+    """login() participates in the auth backoff."""
+
+    @pytest.mark.asyncio
+    async def test_login_on_cooldown_makes_no_network_call(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._auth_cooldown_until = time.monotonic() + 100
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            with pytest.raises(BrinkAuthError, match="cooldown"):
+                await client.login()
+        oidc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_login_failure_sets_cooldown_like_ensure_token(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        before = time.monotonic()
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("bad", is_credentials_error=True),
+        ):
+            with pytest.raises(BrinkAuthError) as exc_info:
+                await client.login()
+        assert exc_info.value.is_credentials_error is True
+        assert client._auth_fail_count == 1
+        assert before + 59 <= client._auth_cooldown_until <= before + 61
+
+    @pytest.mark.asyncio
+    async def test_cooldown_error_keeps_credentials_flag_login_and_ensure(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("bad", is_credentials_error=True),
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client.login()
+            with pytest.raises(BrinkAuthError, match="cooldown") as e1:
+                await client.login()
+            with pytest.raises(BrinkAuthError, match="cooldown") as e2:
+                await client._ensure_token()
+        assert e1.value.is_credentials_error is True
+        assert e2.value.is_credentials_error is True
+
+    @pytest.mark.asyncio
+    async def test_cooldown_flag_false_for_non_credential_failure(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("flow changed"),
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client.login()
+            with pytest.raises(BrinkAuthError, match="cooldown") as e:
+                await client.login()
+        assert e.value.is_credentials_error is False
+
+    @pytest.mark.asyncio
+    async def test_ensure_token_credentials_flag_stored(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("bad", is_credentials_error=True),
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client._ensure_token()
+            with pytest.raises(BrinkAuthError, match="cooldown") as e:
+                await client._ensure_token()
+        assert e.value.is_credentials_error is True
+
+
+class TestCredentialsLatch:
+    """After a definite credentials error no further password logins happen."""
+
+    @staticmethod
+    async def _latch(client: BrinkHomeCloud) -> None:
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("bad", is_credentials_error=True),
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client.login()
+        client._auth_cooldown_until = 0.0  # cooldown elapsed
+
+    @pytest.mark.asyncio
+    async def test_login_refused_after_cooldown_elapsed(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        await self._latch(client)
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            with pytest.raises(BrinkAuthError) as e:
+                await client.login()
+        assert e.value.is_credentials_error is True
+        oidc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ensure_token_refused_after_cooldown_elapsed(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        await self._latch(client)
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            with pytest.raises(BrinkAuthError) as e:
+                await client._ensure_token()
+        assert e.value.is_credentials_error is True
+        oidc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_credentials_failure_does_not_latch(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        with patch.object(
+            client, "_oidc_login", new_callable=AsyncMock,
+            side_effect=BrinkAuthError("flow changed"),
+        ):
+            with pytest.raises(BrinkAuthError):
+                await client.login()
+        client._auth_cooldown_until = 0.0
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            await client.login()
+        oidc.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_successful_refresh_clears_latch(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        await self._latch(client)
+        client._refresh_token = "rt"
+
+        async def fake_refresh() -> None:
+            client._access_token = "new"
+            client._token_expiry = time.monotonic() + 1000
+
+        with patch.object(client, "_refresh_access_token", side_effect=fake_refresh):
+            await client._ensure_token()
+        assert client._credentials_rejected is False
+        assert client._auth_last_credentials_error is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_client_not_latched(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            await client.login()
+        oidc.assert_called_once()
+
+
+class TestInvalidateTokenRace:
+    @pytest.mark.asyncio
+    async def test_stale_failed_token_is_ignored(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "new-token"
+        expiry = time.monotonic() + 3600
+        client._token_expiry = expiry
+        await client.async_invalidate_token("old-token")
+        assert client._token_expiry == expiry
+
+    @pytest.mark.asyncio
+    async def test_matching_failed_token_invalidates(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok"
+        client._token_expiry = time.monotonic() + 3600
+        await client.async_invalidate_token("tok")
+        assert client._token_expiry == 0.0
+
+    @pytest.mark.asyncio
+    async def test_none_is_unconditional(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok"
+        client._token_expiry = time.monotonic() + 3600
+        await client.async_invalidate_token()
+        assert client._token_expiry == 0.0
+
+    @pytest.mark.asyncio
+    async def test_write_passes_token_used(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok-A"
+        client._token_expiry = time.monotonic() + 3600
+        session.put = AsyncMock(
+            side_effect=[_make_mock_response(status=401), _make_mock_response(status=200)]
+        )
+        with (
+            patch.object(client, "_ensure_token", new_callable=AsyncMock),
+            patch.object(client, "async_invalidate_token", new_callable=AsyncMock) as inv,
+        ):
+            await client.write_parameters(SYSTEM_ID, [(1001, "2")])
+        inv.assert_awaited_once_with("tok-A")
+
+
+class TestReadsRetry401:
+    @pytest.mark.asyncio
+    async def test_get_systems_retries_after_401(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "stale"
+        client._token_expiry = time.monotonic() + 3600
+        r401 = _make_mock_response(status=401)
+        r200 = _make_mock_response(
+            status=200, json_data={"items": [{"systemShareId": 5}]}
+        )
+        session.get = AsyncMock(side_effect=[r401, r200])
+
+        async def fake_ensure() -> None:
+            if client._token_expiry == 0.0:
+                client._access_token = "fresh"
+                client._token_expiry = time.monotonic() + 3600
+
+        with patch.object(client, "_ensure_token", side_effect=fake_ensure):
+            systems = await client.get_systems()
+
+        assert [s["system_id"] for s in systems] == [5]
+        assert session.get.call_count == 2
+        assert session.get.call_args_list[0].kwargs["headers"]["Authorization"] == "Bearer stale"
+        assert session.get.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer fresh"
+        r401.release.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_device_data_retries_after_401(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "stale"
+        client._token_expiry = time.monotonic() + 3600
+        session.get = AsyncMock(
+            side_effect=[
+                _make_mock_response(status=401),
+                _make_mock_response(status=200, json_data=UIDESCRIPTION_RESPONSE),
+            ]
+        )
+        with patch.object(client, "_ensure_token", new_callable=AsyncMock):
+            data = await client.get_device_data(SYSTEM_ID)
+        assert len(data["components"]) == 1
+        assert session.get.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["systems", "device"])
+    async def test_second_401_raises_client_response_error(self, method: str) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "stale"
+        client._token_expiry = time.monotonic() + 3600
+        r1 = _make_mock_response(status=401)
+        r2 = _make_mock_response(status=401)
+        session.get = AsyncMock(side_effect=[r1, r2])
+        with patch.object(client, "_ensure_token", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+                if method == "systems":
+                    await client.get_systems()
+                else:
+                    await client.get_device_data(SYSTEM_ID)
+        assert exc_info.value.status == 401
+        assert session.get.call_count == 2
+        r1.release.assert_awaited()
+        r2.release.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_read_401_reauth_outside_timeout_and_token_passed(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok-A"
+        client._token_expiry = time.monotonic() + 3600
+        session.get = AsyncMock(
+            side_effect=[
+                _make_mock_response(status=401),
+                _make_mock_response(status=200, json_data={"items": []}),
+            ]
+        )
+        depth = 0
+        depths: list[int] = []
+        real_timeout = asyncio.timeout
+
+        @contextlib.asynccontextmanager
+        async def counting_timeout(delay: float | None):  # type: ignore[no-untyped-def]
+            nonlocal depth
+            depth += 1
+            try:
+                async with real_timeout(delay):
+                    yield
+            finally:
+                depth -= 1
+
+        async def fake_ensure() -> None:
+            depths.append(depth)
+
+        with (
+            patch.object(asyncio, "timeout", counting_timeout),
+            patch.object(client, "_ensure_token", side_effect=fake_ensure),
+            patch.object(client, "async_invalidate_token", new_callable=AsyncMock) as inv,
+        ):
+            await client.get_systems()
+        assert depths == [0, 0]
+        inv.assert_awaited_once_with("tok-A")
+
+    @pytest.mark.asyncio
+    async def test_non_401_error_not_retried(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "tok"
+        client._token_expiry = time.monotonic() + 3600
+        r = _make_mock_response(status=404)
+        r.raise_for_status = MagicMock(side_effect=_client_error_404())
+        session.get = AsyncMock(return_value=r)
+        with pytest.raises(aiohttp.ClientResponseError):
+            await client.get_systems()
+        assert session.get.call_count == 1
+        r.release.assert_awaited()
+
+
+class TestTokenJsonValidation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc", [ValueError("bad"), aiohttp.ContentTypeError(MagicMock(), ())]
+    )
+    async def test_exchange_invalid_json(self, exc: Exception) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(status=200, url=OIDC_TOKEN_URL)
+        resp.json = AsyncMock(side_effect=exc)
+        session.post = AsyncMock(return_value=resp)
+        with pytest.raises(BrinkAuthError) as e:
+            await client._exchange_code_for_tokens("code", "ver")
+        assert e.value.is_credentials_error is False
+        assert client._access_token is None
+        resp.release.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[1, 2], "str", None, 5])
+    async def test_exchange_non_dict_json(self, payload: Any) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(status=200, url=OIDC_TOKEN_URL)
+        resp.json = AsyncMock(return_value=payload)
+        session.post = AsyncMock(return_value=resp)
+        with pytest.raises(BrinkAuthError):
+            await client._exchange_code_for_tokens("code", "ver")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[1], "s", None])
+    async def test_refresh_non_dict_json_clears_token(self, payload: Any) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        resp = _make_mock_response(status=200, url=OIDC_TOKEN_URL)
+        resp.json = AsyncMock(return_value=payload)
+        session.post = AsyncMock(return_value=resp)
+        with pytest.raises(BrinkAuthError) as e:
+            await client._refresh_access_token()
+        assert not isinstance(e.value, _RefreshTransientError)
+        assert client._refresh_token is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_content_type_error_is_unusable_not_transient(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        resp = _make_mock_response(status=200, url=OIDC_TOKEN_URL)
+        resp.json = AsyncMock(side_effect=aiohttp.ContentTypeError(MagicMock(), ()))
+        session.post = AsyncMock(return_value=resp)
+        with pytest.raises(BrinkAuthError) as e:
+            await client._refresh_access_token()
+        assert not isinstance(e.value, _RefreshTransientError)
+        assert client._refresh_token is None
+
+
+class TestRefreshTokenRetention:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 400])
+    async def test_rejected_grant_clears_token(self, status: int) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        session.post = AsyncMock(return_value=_make_mock_response(status=status))
+        with pytest.raises(BrinkAuthError):
+            await client._refresh_access_token()
+        assert client._refresh_token is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_5xx_keeps_token_transient(self, status: int) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        resp = _make_mock_response(status=status)
+        session.post = AsyncMock(return_value=resp)
+        with pytest.raises(_RefreshTransientError) as e:
+            await client._refresh_access_token()
+        assert isinstance(e.value.original, aiohttp.ClientError)
+        assert client._refresh_token == "r"
+        resp.release.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_keeps_token_transient(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        session.post = AsyncMock(side_effect=asyncio.TimeoutError())
+        with pytest.raises(_RefreshTransientError) as e:
+            await client._refresh_access_token()
+        assert isinstance(e.value.original, asyncio.TimeoutError)
+        assert client._refresh_token == "r"
+
+    @pytest.mark.asyncio
+    async def test_ensure_token_transient_refresh_no_password_login(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._access_token = "old"
+        client._token_expiry = 0.0
+        client._refresh_token = "r"
+        original = aiohttp.ClientConnectionError("down")
+        with (
+            patch.object(
+                client, "_refresh_access_token", new_callable=AsyncMock,
+                side_effect=_RefreshTransientError("x", original),
+            ),
+            patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc,
+        ):
+            with pytest.raises(aiohttp.ClientConnectionError) as e:
+                await client._ensure_token()
+        assert e.value is original
+        oidc.assert_not_called()
+        assert client._auth_fail_count == 0
+        assert client._auth_cooldown_until == 0.0
+        assert client._refresh_token == "r"
+        assert not client._auth_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_ensure_token_transient_timeout_reraised(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        with patch.object(
+            client, "_refresh_access_token", new_callable=AsyncMock,
+            side_effect=_RefreshTransientError("x", asyncio.TimeoutError()),
+        ):
+            with pytest.raises(asyncio.TimeoutError):
+                await client._ensure_token()
+
+    @pytest.mark.asyncio
+    async def test_exchange_verification_transient_does_not_fail_login(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        token_resp = _make_mock_response(
+            status=200,
+            json_data=_make_token_response(
+                access_token="acc", refresh_token="ref"
+            ),
+            url=OIDC_TOKEN_URL,
+        )
+        session.post = AsyncMock(
+            side_effect=[token_resp, aiohttp.ClientConnectionError("down")]
+        )
+        await client._exchange_code_for_tokens("code", "ver")
+        assert client._access_token == "acc"
+        assert client._refresh_token == "ref"
+
+
+class TestCloseRace:
+    @pytest.mark.asyncio
+    async def test_close_sets_closed_and_blocks_calls(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        assert client._closed is False
+        await client.close()
+        assert client._closed is True
+        with patch.object(client, "_oidc_login", new_callable=AsyncMock) as oidc:
+            with pytest.raises(BrinkAuthError, match="closed"):
+                await client.login()
+            with pytest.raises(BrinkAuthError, match="closed"):
+                await client._ensure_token()
+        oidc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exchange_after_close_does_not_store_tokens(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        resp = _make_mock_response(
+            status=200,
+            json_data=_make_token_response(access_token="acc", refresh_token="ref"),
+            url=OIDC_TOKEN_URL,
+        )
+
+        async def post_then_close(*args: Any, **kwargs: Any) -> Any:
+            await client.close()
+            return resp
+
+        session.post = AsyncMock(side_effect=post_then_close)
+        with pytest.raises(BrinkAuthError, match="closed"):
+            await client._exchange_code_for_tokens("code", "ver")
+        assert client._access_token is None
+        assert client._refresh_token is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_after_close_does_not_store_tokens(self) -> None:
+        session = _make_mock_session()
+        client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+        client._refresh_token = "r"
+        resp = _make_mock_response(
+            status=200,
+            json_data=_make_token_response(access_token="acc", refresh_token="r2"),
+            url=OIDC_TOKEN_URL,
+        )
+
+        async def post_then_close(*args: Any, **kwargs: Any) -> Any:
+            await client.close()
+            return resp
+
+        session.post = AsyncMock(side_effect=post_then_close)
+        with pytest.raises(BrinkAuthError, match="closed"):
+            await client._refresh_access_token()
+        assert client._access_token is None
+        assert client._refresh_token is None
+
+
+class TestRedirect308:
+    @pytest.mark.asyncio
+    async def test_submit_login_accepts_308(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        oidc = MagicMock(spec=aiohttp.ClientSession)
+        resp = _make_mock_response(
+            status=308, headers={"Location": _make_redirect_url("c308", "st")}
+        )
+        oidc.post = AsyncMock(return_value=resp)
+        code = await client._submit_login_credentials(
+            oidc, "https://www.brink-home.com/idsrv/login", "csrf", None, "st"
+        )
+        assert code == "c308"
+
+    @pytest.mark.asyncio
+    async def test_follow_redirects_accepts_308(self) -> None:
+        client = BrinkHomeCloud(_make_mock_session(), TEST_EMAIL, TEST_PASSWORD)
+        oidc = MagicMock(spec=aiohttp.ClientSession)
+        resp = _make_mock_response(
+            status=308, headers={"Location": _make_redirect_url("cc", "st")}
+        )
+        oidc.get = AsyncMock(return_value=resp)
+        code = await client._follow_redirects_for_code(
+            oidc, "https://www.brink-home.com/a", "https://www.brink-home.com/", "st"
+        )
+        assert code == "cc"

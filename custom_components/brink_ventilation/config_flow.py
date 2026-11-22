@@ -97,6 +97,24 @@ async def _async_test_credentials(
         await client.close()
 
 
+async def _async_validate_credentials(
+    hass: HomeAssistant, username: str, password: str, context: str
+) -> str | None:
+    """Test credentials and map any failure to an error key (None on success)."""
+    try:
+        await _async_test_credentials(hass, username, password)
+    except BrinkAuthError as ex:
+        return "invalid_auth" if ex.is_credentials_error else "cannot_connect"
+    except aiohttp.ClientResponseError as err:
+        return "invalid_auth" if err.status == 401 else "cannot_connect"
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return "cannot_connect"
+    except Exception:
+        _LOGGER.exception("Unexpected exception during %s", context)
+        return "unknown"
+    return None
+
+
 class BrinkHomeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Brink-home."""
 
@@ -111,33 +129,20 @@ class BrinkHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            username: str = user_input[CONF_USERNAME]
+            username: str = user_input[CONF_USERNAME].strip()
             password: str = user_input[CONF_PASSWORD]
-            unique_id = username.lower()
-            await self.async_set_unique_id(unique_id)
+            await self.async_set_unique_id(username.lower())
             self._abort_if_unique_id_configured()
 
-            try:
-                await _async_test_credentials(self.hass, username, password)
-            except BrinkAuthError as ex:
-                errors["base"] = (
-                    "invalid_auth" if ex.is_credentials_error
-                    else "cannot_connect"
-                )
-            except aiohttp.ClientResponseError as err:
-                if err.status == 401:
-                    errors["base"] = "invalid_auth"
-                else:
-                    errors["base"] = "cannot_connect"
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected exception during config flow")
-                errors["base"] = "unknown"
-            else:
+            error = await _async_validate_credentials(
+                self.hass, username, password, "config flow"
+            )
+            if error is None:
                 return self.async_create_entry(
-                    title=username, data=user_input
+                    title=username,
+                    data={**user_input, CONF_USERNAME: username},
                 )
+            errors["base"] = error
 
         return self.async_show_form(
             step_id="user",
@@ -161,21 +166,10 @@ class BrinkHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             password: str = user_input[CONF_PASSWORD]
 
-            try:
-                await _async_test_credentials(
-                    self.hass, self._username, password
-                )
-            except BrinkAuthError as ex:
-                errors["base"] = (
-                    "invalid_auth" if ex.is_credentials_error
-                    else "cannot_connect"
-                )
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected exception during reauth")
-                errors["base"] = "unknown"
-            else:
+            error = await _async_validate_credentials(
+                self.hass, self._username, password, "reauth"
+            )
+            if error is None:
                 return self.async_update_reload_and_abort(
                     self._get_reauth_entry(),
                     data_updates={
@@ -183,6 +177,7 @@ class BrinkHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_PASSWORD: password,
                     },
                 )
+            errors["base"] = error
 
         return self.async_show_form(
             step_id="reauth_confirm",
@@ -207,28 +202,30 @@ class BrinkHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            username: str = user_input[CONF_USERNAME]
+            username: str = user_input[CONF_USERNAME].strip()
             password: str = user_input[CONF_PASSWORD]
 
-            try:
-                await _async_test_credentials(self.hass, username, password)
-            except BrinkAuthError as ex:
-                errors["base"] = (
-                    "invalid_auth" if ex.is_credentials_error
-                    else "cannot_connect"
-                )
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected exception during reconfigure")
-                errors["base"] = "unknown"
-            else:
-                await self.async_set_unique_id(username.lower())
-                self._abort_if_unique_id_mismatch(reason="account_mismatch")
+            # Compare against the stripped stored unique_id so entries created
+            # before usernames were stripped (e.g. " user@x.com") can still be
+            # reconfigured; the unique_id is normalised on success.
+            reconfigure_entry = self._get_reconfigure_entry()
+            new_unique_id = username.lower()
+            if (reconfigure_entry.unique_id or "").strip() != new_unique_id:
+                return self.async_abort(reason="account_mismatch")
+
+            error = await _async_validate_credentials(
+                self.hass, username, password, "reconfigure"
+            )
+            if error is None:
                 return self.async_update_reload_and_abort(
-                    self._get_reconfigure_entry(),
-                    data_updates=user_input,
+                    reconfigure_entry,
+                    unique_id=new_unique_id,
+                    data_updates={
+                        CONF_USERNAME: username,
+                        CONF_PASSWORD: password,
+                    },
                 )
+            errors["base"] = error
 
         reconfigure_entry = self._get_reconfigure_entry()
         return self.async_show_form(

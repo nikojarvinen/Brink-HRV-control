@@ -76,6 +76,7 @@ def _make_mock_client(
     """Return a fully mocked BrinkHomeCloud instance."""
     client = AsyncMock()
     client.login = AsyncMock(side_effect=login_side_effect)
+    client.async_invalidate_token = AsyncMock(return_value=None)
     client._session = MagicMock()
 
     if get_systems_side_effect is not None:
@@ -164,13 +165,16 @@ async def test_successful_poll_sets_connected(hass: HomeAssistant) -> None:
     assert coordinator.consecutive_errors == 0
     assert coordinator.last_successful_poll is not None
     assert isinstance(coordinator.last_successful_poll, datetime)
+    assert coordinator.last_successful_poll.tzinfo is not None
     assert coordinator.last_error_message is None
 
 
 async def test_auth_error_sets_authentication_error(hass: HomeAssistant) -> None:
     """BrinkAuthError sets authentication_error status."""
     mock_client = _make_mock_client(
-        get_systems_side_effect=BrinkAuthError("Token expired"),
+        get_systems_side_effect=BrinkAuthError(
+            "Token expired", is_credentials_error=True
+        ),
     )
     coordinator = await _setup_coordinator(hass, mock_client)
 
@@ -184,16 +188,17 @@ async def test_auth_error_sets_authentication_error(hass: HomeAssistant) -> None
 
 async def test_401_retry_fail_sets_authentication_error(hass: HomeAssistant) -> None:
     """401 that fails re-auth sets authentication_error status."""
-    mock_client = _make_mock_client(
-        login_side_effect=BrinkAuthError("Credentials invalid"),
-    )
+    mock_client = _make_mock_client()
     mock_client.get_systems = AsyncMock(
-        side_effect=aiohttp.ClientResponseError(
-            request_info=MagicMock(),
-            history=(),
-            status=401,
-            message="Unauthorized",
-        ),
+        side_effect=[
+            aiohttp.ClientResponseError(
+                request_info=MagicMock(),
+                history=(),
+                status=401,
+                message="Unauthorized",
+            ),
+            BrinkAuthError("Credentials invalid", is_credentials_error=True),
+        ],
     )
 
     coordinator = await _setup_coordinator(hass, mock_client)
@@ -337,7 +342,9 @@ async def test_consecutive_errors_reset_on_success(hass: HomeAssistant) -> None:
 async def test_last_error_message_recorded(hass: HomeAssistant) -> None:
     """Error message string is stored in last_error_message."""
     mock_client = _make_mock_client(
-        get_systems_side_effect=BrinkAuthError("Invalid credentials provided"),
+        get_systems_side_effect=BrinkAuthError(
+            "Invalid credentials provided", is_credentials_error=True
+        ),
     )
     coordinator = await _setup_coordinator(hass, mock_client)
 

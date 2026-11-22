@@ -615,6 +615,147 @@ async def test_reconfigure_flow_account_mismatch(hass: HomeAssistant) -> None:
     assert result["reason"] == "account_mismatch"
 
 
+def _response_error(status: int) -> aiohttp.ClientResponseError:
+    return aiohttp.ClientResponseError(
+        request_info=aiohttp.RequestInfo(
+            url="https://example.com",
+            method="POST",
+            headers={},
+            real_url="https://example.com",
+        ),
+        history=(),
+        status=status,
+        message="error",
+    )
+
+
+def _existing_entry() -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title=TEST_EMAIL,
+        data={CONF_USERNAME: TEST_EMAIL, CONF_PASSWORD: TEST_PASSWORD},
+        unique_id=TEST_EMAIL.lower(),
+    )
+
+
+async def test_user_flow_strips_username_whitespace(hass: HomeAssistant) -> None:
+    """Whitespace around the username is stripped from unique_id, title and data."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    with (
+        _patch_test_credentials() as mock_test,
+        patch("custom_components.brink_ventilation.async_setup_entry", return_value=True),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: f"  {TEST_EMAIL}\t ", CONF_PASSWORD: TEST_PASSWORD},
+        )
+        await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == TEST_EMAIL
+    assert result["data"][CONF_USERNAME] == TEST_EMAIL
+    assert result["result"].unique_id == TEST_EMAIL.lower()
+    assert mock_test.call_args.args[1] == TEST_EMAIL
+
+
+async def test_reauth_flow_client_response_error_401(hass: HomeAssistant) -> None:
+    """Reauth maps aiohttp 401 to invalid_auth, other statuses to cannot_connect."""
+    entry = _existing_entry()
+    entry.add_to_hass(hass)
+    result = await entry.start_reauth_flow(hass)
+
+    with _patch_test_credentials(side_effect=_response_error(401)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "bad"}
+        )
+    assert result["errors"] == {"base": "invalid_auth"}
+
+    with _patch_test_credentials(side_effect=_response_error(500)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_PASSWORD: "bad"}
+        )
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_reconfigure_flow_client_response_error_401(hass: HomeAssistant) -> None:
+    """Reconfigure maps aiohttp 401 to invalid_auth."""
+    entry = _existing_entry()
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with _patch_test_credentials(side_effect=_response_error(401)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: TEST_EMAIL, CONF_PASSWORD: "bad"},
+        )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_reconfigure_mismatch_aborts_before_network(hass: HomeAssistant) -> None:
+    """Account mismatch aborts without testing credentials against the network."""
+    entry = _existing_entry()
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with _patch_test_credentials() as mock_test:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "other@example.com", CONF_PASSWORD: TEST_PASSWORD},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "account_mismatch"
+    mock_test.assert_not_called()
+
+
+async def test_reconfigure_flow_strips_username_whitespace(hass: HomeAssistant) -> None:
+    """Reconfigure strips whitespace so it still matches the account."""
+    entry = _existing_entry()
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with _patch_test_credentials():
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: f" {TEST_EMAIL} ", CONF_PASSWORD: TEST_NEW_PASSWORD},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_USERNAME] == TEST_EMAIL
+    assert entry.data[CONF_PASSWORD] == TEST_NEW_PASSWORD
+
+
+async def test_reconfigure_legacy_unstripped_unique_id(hass: HomeAssistant) -> None:
+    """An entry whose unique_id has stray whitespace can still be reconfigured.
+
+    Entries created before usernames were stripped may have a unique_id like
+    " user@x.com ". Reconfigure must match it and normalise the unique_id.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=TEST_EMAIL,
+        data={CONF_USERNAME: f" {TEST_EMAIL} ", CONF_PASSWORD: TEST_PASSWORD},
+        unique_id=f" {TEST_EMAIL.lower()} ",
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+
+    with _patch_test_credentials():
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: f" {TEST_EMAIL} ", CONF_PASSWORD: TEST_NEW_PASSWORD},
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == TEST_EMAIL.lower()
+    assert entry.data[CONF_USERNAME] == TEST_EMAIL
+
+
 # ---------------------------------------------------------------------------
 # Options flow tests
 # ---------------------------------------------------------------------------

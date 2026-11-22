@@ -10,7 +10,7 @@ import secrets
 import time
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qs, urlunsplit, urlparse
+from urllib.parse import parse_qs, urljoin, urlunsplit, urlparse
 
 import aiohttp
 
@@ -30,6 +30,12 @@ _TRUSTED_HOST = "www.brink-home.com"
 
 # valueState enum used in the v1.1 write payload (matches the SPA)
 _VALUE_STATE_OK = 0
+
+# HTTP statuses treated as redirects in the OIDC flow
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+# Fallback access-token lifetime (seconds) when the server omits expires_in
+_DEFAULT_EXPIRES_IN = 3599
 
 
 def _is_trusted_url(url: str) -> bool:
@@ -103,12 +109,17 @@ class _InputFieldExtractor(HTMLParser):
         super().__init__()
         self._targets = {n.lower() for n in target_names}
         self.results: dict[str, str] = {}
+        self.names_seen: set[str] = set()
+        self.has_password_input = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag != "input":
             return
         attr_dict = {k.lower(): (v or "") for k, v in attrs}
         name = attr_dict.get("name", "").lower()
+        self.names_seen.add(name)
+        if attr_dict.get("type", "").strip().lower() == "password":
+            self.has_password_input = True
         if name in self._targets and "value" in attr_dict:
             self.results[name] = attr_dict["value"]
 
@@ -143,51 +154,143 @@ class BrinkHomeCloud:
         # Auth failure backoff state
         self._auth_cooldown_until: float = 0.0
         self._auth_fail_count: int = 0
+        self._auth_last_credentials_error: bool = False
+        # Latched after a definite credentials failure: no further password
+        # logins (account-lockout protection) until a refresh token works or
+        # the client is rebuilt with new credentials.
+        self._credentials_rejected: bool = False
         self._auth_lock = asyncio.Lock()
+
+        # Set by close(); stops in-flight flows from re-populating tokens
+        self._closed = False
 
     # -------------------------------------------------------------------------
     # Public API methods
     # -------------------------------------------------------------------------
 
     async def login(self) -> None:
-        """Perform OIDC login to obtain a Bearer token."""
-        await self._oidc_login()
+        """Perform OIDC login to obtain a Bearer token.
+
+        Serialized with ``_ensure_token`` through ``_auth_lock`` so two OIDC
+        flows never mutate the token state concurrently. Participates in the
+        same failure backoff as ``_ensure_token``: during a cooldown no
+        network request is made. On success the backoff state is reset.
+        """
+        async with self._auth_lock:
+            if self._closed:
+                raise BrinkAuthError("Client is closed")
+            self._raise_if_on_cooldown()
+            self._raise_if_credentials_rejected()
+            try:
+                await self._oidc_login()
+            except BrinkAuthError as exc:
+                self._record_auth_failure(exc)
+                raise
+            self._reset_auth_backoff()
+
+    async def async_invalidate_token(self, failed_token: str | None = None) -> None:
+        """Mark the current access token as expired.
+
+        Used when an API call returns 401. The access and refresh tokens are
+        kept so ``_ensure_token`` tries the refresh-token path first and only
+        then falls back to a full OIDC login (with the usual backoff).
+
+        Args:
+            failed_token: The token the failing request used. If given and it
+                differs from the current token, another task already
+                refreshed it and nothing is done.
+        """
+        async with self._auth_lock:
+            if failed_token is not None and failed_token != self._access_token:
+                return
+            self._token_expiry = 0.0
 
     async def close(self) -> None:
         """Clear sensitive state. Call on integration unload."""
+        self._closed = True
         self._access_token = None
         self._token_expiry = 0.0
         self._refresh_token = None
         self._auth_cooldown_until = 0.0
         self._auth_fail_count = 0
+        self._auth_last_credentials_error = False
+        self._credentials_rejected = False
         self._username = ""
         self._password = ""
 
-    async def get_systems(self) -> list[dict[str, Any]]:
-        """Get list of systems from the v1.1 API."""
+    async def _get_json(self, url: str) -> Any:
+        """GET a JSON document with Bearer auth, retrying once on HTTP 401.
+
+        On the first 401 the used token is invalidated and re-acquired
+        (outside the per-request timeout); a second 401 raises
+        ``aiohttp.ClientResponseError``.
+        """
         await self._ensure_token()
 
-        url = f"{API_V1_URL}systems?pageSize=5"
-        async with asyncio.timeout(20):
-            resp = await self._session.get(
-                url,
-                headers=self._bearer_headers(),
-            )
-            resp.raise_for_status()
-            v1_data = await resp.json()
+        for attempt in range(2):
+            token_used = self._access_token
+            async with asyncio.timeout(20):
+                resp = await self._session.get(
+                    url,
+                    headers=self._bearer_headers(),
+                )
+                try:
+                    if resp.status != 401:
+                        resp.raise_for_status()
+                        return await resp.json()
+                    if attempt == 1:
+                        resp.raise_for_status()
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=401,
+                            message="Unauthorized",
+                        )
+                finally:
+                    await resp.release()
 
-        _LOGGER.debug(
-            "get_systems v1.1 response: %s systems found",
-            v1_data.get("totalCount", 0),
-        )
+            _LOGGER.debug("GET got 401, refreshing token and retrying")
+            await self.async_invalidate_token(token_used)
+            await self._ensure_token()
+
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def get_systems(self) -> list[dict[str, Any]]:
+        """Get list of systems from the v1.1 API."""
+        v1_data = await self._get_json(f"{API_V1_URL}systems?pageSize=5")
+
+        items: list[Any] = []
+        if isinstance(v1_data, dict):
+            _LOGGER.debug(
+                "get_systems v1.1 response: %s systems found",
+                v1_data.get("totalCount", 0),
+            )
+            raw_items = v1_data.get("items", [])
+            if isinstance(raw_items, list):
+                items = raw_items
+            else:
+                _LOGGER.warning(
+                    "Unexpected 'items' type in systems response: %s",
+                    type(raw_items).__name__,
+                )
+        else:
+            _LOGGER.warning(
+                "Unexpected systems response type: %s", type(v1_data).__name__
+            )
 
         systems: list[dict[str, Any]] = []
-        for item in v1_data.get("items", []):
+        for item in items:
+            if not isinstance(item, dict):
+                _LOGGER.warning(
+                    "Skipping non-object system entry (type: %s)",
+                    type(item).__name__,
+                )
+                continue
             system_id = item.get("systemShareId")
             if system_id is None:
                 _LOGGER.warning(
                     "Skipping system with missing systemShareId (keys: %s)",
-                    list(item.keys()) if isinstance(item, dict) else type(item).__name__,
+                    list(item.keys()),
                 )
                 continue
             systems.append(
@@ -211,16 +314,7 @@ class BrinkHomeCloud:
                 f"system_id must be an integer, got {type(system_id).__name__}"
             )
 
-        await self._ensure_token()
-
-        url = f"{API_V1_URL}systems/{system_id}/uidescription"
-        async with asyncio.timeout(20):
-            resp = await self._session.get(
-                url,
-                headers=self._bearer_headers(),
-            )
-            resp.raise_for_status()
-            data = await resp.json()
+        data = await self._get_json(f"{API_V1_URL}systems/{system_id}/uidescription")
 
         _LOGGER.debug("get_device_data for system %s received", system_id)
 
@@ -260,6 +354,9 @@ class BrinkHomeCloud:
         _LOGGER.debug("Writing parameters to system %s: %s", system_id, params)
 
         for attempt in range(2):
+            token_used = self._access_token
+            # The timeout covers only the HTTP PUT and response handling; the
+            # re-authentication below has its own (longer) timeouts.
             async with asyncio.timeout(20):
                 resp = await self._session.put(
                     url,
@@ -267,27 +364,27 @@ class BrinkHomeCloud:
                     headers=self._bearer_headers(),
                 )
 
-                if resp.status == 401:
-                    await resp.release()
-                    if attempt == 0:
-                        _LOGGER.debug("Write got 401, refreshing token and retrying")
-                        # Force token refresh by expiring it
-                        async with self._auth_lock:
-                            self._token_expiry = 0.0
-                        await self._ensure_token()
-                        continue
-                    _LOGGER.warning(
-                        "Write to Brink API failed: still getting 401 after "
-                        "re-authentication — credentials may have changed"
-                    )
-                    raise BrinkAuthError("Write failed: persistent 401 after re-auth")
+                if resp.status != 401:
+                    try:
+                        resp.raise_for_status()
+                        await resp.read()
+                    finally:
+                        await resp.release()
+                    return
 
-                try:
-                    resp.raise_for_status()
-                    await resp.read()
-                finally:
-                    await resp.release()
-                return
+                await resp.release()
+
+            if attempt == 0:
+                _LOGGER.debug("Write got 401, refreshing token and retrying")
+                await self.async_invalidate_token(token_used)
+                await self._ensure_token()
+                continue
+
+            _LOGGER.warning(
+                "Write to Brink API failed: still getting 401 after "
+                "re-authentication — credentials may have changed"
+            )
+            raise BrinkAuthError("Write failed: persistent 401 after re-auth")
 
     # -------------------------------------------------------------------------
     # OIDC PKCE Authentication
@@ -449,6 +546,9 @@ class BrinkHomeCloud:
             BrinkAuthError: If login fails or the authorization code
                 cannot be extracted.
         """
+        if not self._username or not self._password:
+            raise BrinkAuthError("Cannot log in: no credentials available")
+
         form_data: dict[str, str] = {
             "Username": self._username,
             "Password": self._password,
@@ -476,7 +576,7 @@ class BrinkHomeCloud:
 
             authorization_code: str | None = None
 
-            if login_resp.status in (301, 302, 303, 307):
+            if login_resp.status in _REDIRECT_STATUSES:
                 redirect_location = login_resp.headers.get("Location", "")
                 await login_resp.release()
                 authorization_code = self._extract_code_from_redirect(
@@ -492,7 +592,13 @@ class BrinkHomeCloud:
                     )
             elif login_resp.status == 200:
                 body = await login_resp.text()
-                if "invalid" in body.lower() or "error" in body.lower():
+                await login_resp.release()
+                # A 200 (no redirect) means the login form was shown again.
+                if (
+                    self._has_login_form(body)
+                    or "invalid" in body.lower()
+                    or "error" in body.lower()
+                ):
                     raise BrinkAuthError(
                         "Invalid username or password",
                         is_credentials_error=True,
@@ -574,8 +680,12 @@ class BrinkHomeCloud:
                     f"OIDC token exchange failed with status {token_resp.status}"
                 )
 
-            token_json = await token_resp.json()
-            await token_resp.release()
+            try:
+                token_json = await self._read_token_json(
+                    token_resp, "OIDC token response"
+                )
+            finally:
+                await token_resp.release()
 
         access_token = token_json.get("access_token")
         if not access_token:
@@ -588,9 +698,10 @@ class BrinkHomeCloud:
             raise BrinkAuthError(
                 "OIDC token response did not contain an access token"
             )
+        if self._closed:
+            raise BrinkAuthError("Client is closed")
         self._access_token = access_token
-        expires_in: int = token_json.get("expires_in", 3599)
-        self._token_expiry = time.monotonic() + expires_in - 60
+        expires_in = self._set_token_expiry(token_json.get("expires_in"))
 
         # Store refresh token if the server provided one
         refresh_token = token_json.get("refresh_token")
@@ -604,10 +715,18 @@ class BrinkHomeCloud:
                     "OIDC login successful, refresh token verified — "
                     "silent token renewal is active"
                 )
+            except _RefreshTransientError:
+                # Network problem / 5xx: the refresh token was kept and the
+                # login itself succeeded, so do not fail it.
+                _LOGGER.debug(
+                    "Refresh token verification hit a transient error — "
+                    "keeping tokens"
+                )
             except BrinkAuthError:
                 # Restore the refresh token — it may still be valid,
                 # the verification failure could be transient (timeout etc.)
-                self._refresh_token = refresh_token
+                if not self._closed:
+                    self._refresh_token = refresh_token
                 _LOGGER.warning(
                     "Refresh token verification failed — will fall back to "
                     "full OIDC re-authentication on token expiry"
@@ -634,13 +753,11 @@ class BrinkHomeCloud:
         """
         max_redirects = 10
         current_url = redirect_url
+        # URL of the request that produced current_url (for relative Locations)
+        request_base = base_url
 
         for _ in range(max_redirects):
-            if current_url.startswith("/"):
-                parsed_base = urlparse(base_url)
-                current_url = (
-                    f"{parsed_base.scheme}://{parsed_base.netloc}{current_url}"
-                )
+            current_url = urljoin(request_base, current_url)
 
             code = self._extract_code_from_redirect(
                 current_url, expected_state=expected_state
@@ -661,11 +778,13 @@ class BrinkHomeCloud:
                         current_url, allow_redirects=False
                     )
 
-                if resp.status in (301, 302, 303, 307):
-                    current_url = resp.headers.get("Location", "")
+                if resp.status in _REDIRECT_STATUSES:
+                    location = resp.headers.get("Location", "")
                     await resp.release()
-                    if not current_url:
+                    if not location:
                         break
+                    request_base = current_url
+                    current_url = location
                 else:
                     resp_url = str(resp.url)
                     await resp.release()
@@ -687,35 +806,90 @@ class BrinkHomeCloud:
     # Token management
     # -------------------------------------------------------------------------
 
+    def _raise_if_on_cooldown(self) -> None:
+        """Raise BrinkAuthError if the auth backoff cooldown is active.
+
+        The error carries the ``is_credentials_error`` flag of the failure
+        that started the cooldown so callers can still start reauth.
+        """
+        now = time.monotonic()
+        if now < self._auth_cooldown_until:
+            remaining = int(self._auth_cooldown_until - now)
+            raise BrinkAuthError(
+                f"Authentication on cooldown, next retry in {remaining}s",
+                is_credentials_error=self._auth_last_credentials_error,
+            )
+
+    def _raise_if_credentials_rejected(self) -> None:
+        """Refuse a password login once the credentials were rejected.
+
+        Prevents re-POSTing a known-bad password (account lockout). No
+        network request is made.
+        """
+        if self._credentials_rejected:
+            raise BrinkAuthError(
+                "Credentials were rejected; re-authentication required",
+                is_credentials_error=True,
+            )
+
+    def _record_auth_failure(self, exc: BrinkAuthError) -> None:
+        """Update backoff state after a failed authentication attempt."""
+        self._auth_fail_count = min(self._auth_fail_count + 1, 5)
+        backoff = min(60 * (2 ** (self._auth_fail_count - 1)), 900)
+        self._auth_cooldown_until = time.monotonic() + backoff
+        self._auth_last_credentials_error = exc.is_credentials_error
+        if exc.is_credentials_error:
+            self._credentials_rejected = True
+        _LOGGER.warning(
+            "OIDC authentication failed (attempt %s), "
+            "backing off for %s seconds before next retry",
+            self._auth_fail_count,
+            backoff,
+        )
+
+    def _reset_auth_backoff(self) -> None:
+        """Clear backoff state after a successful authentication."""
+        self._auth_fail_count = 0
+        self._auth_cooldown_until = 0.0
+        self._auth_last_credentials_error = False
+        self._credentials_rejected = False
+
     async def _ensure_token(self) -> None:
         """Ensure we have a valid Bearer token, using refresh or full OIDC.
 
         Uses exponential backoff on repeated failures to avoid hammering
         the server. Backoff schedule: 60s, 120s, 240s, 480s, 900s (cap).
+
+        If the refresh token request fails for a transient reason (network
+        error, timeout, 5xx) the original network exception is re-raised
+        instead of falling back to a password login.
         """
+        if self._closed:
+            raise BrinkAuthError("Client is closed")
         if self._access_token and time.monotonic() < self._token_expiry:
             return
 
         async with self._auth_lock:
+            if self._closed:
+                raise BrinkAuthError("Client is closed")
             # Re-check after acquiring lock (another coroutine may have refreshed)
             if self._access_token and time.monotonic() < self._token_expiry:
                 return
 
             # Check cooldown before hitting the server
-            now = time.monotonic()
-            if now < self._auth_cooldown_until:
-                remaining = int(self._auth_cooldown_until - now)
-                raise BrinkAuthError(
-                    f"Authentication on cooldown, next retry in {remaining}s"
-                )
+            self._raise_if_on_cooldown()
 
             # Try refresh token first (silent, no full OIDC flow)
             if self._refresh_token:
                 try:
                     await self._refresh_access_token()
-                    self._auth_fail_count = 0
-                    self._auth_cooldown_until = 0.0
+                    self._reset_auth_backoff()
                     return
+                except _RefreshTransientError as transient:
+                    _LOGGER.debug(
+                        "Token refresh failed transiently, will retry later"
+                    )
+                    raise transient.original from transient
                 except BrinkAuthError:
                     _LOGGER.info(
                         "Refresh token expired or revoked, "
@@ -723,23 +897,15 @@ class BrinkHomeCloud:
                     )
                     # _refresh_access_token already cleared self._refresh_token
 
-            # Full OIDC login as last resort
+            # Full OIDC login as last resort (never with known-bad credentials)
+            self._raise_if_credentials_rejected()
             _LOGGER.debug("Performing full OIDC login")
             try:
                 await self._oidc_login()
-                self._auth_fail_count = 0
-                self._auth_cooldown_until = 0.0
-            except BrinkAuthError:
-                self._auth_fail_count = min(self._auth_fail_count + 1, 5)
-                backoff = min(60 * (2 ** (self._auth_fail_count - 1)), 900)
-                self._auth_cooldown_until = time.monotonic() + backoff
-                _LOGGER.warning(
-                    "OIDC authentication failed (attempt %s), "
-                    "backing off for %s seconds before next retry",
-                    self._auth_fail_count,
-                    backoff,
-                )
+            except BrinkAuthError as exc:
+                self._record_auth_failure(exc)
                 raise
+            self._reset_auth_backoff()
 
     def _bearer_headers(self) -> dict[str, str]:
         """Return headers with Bearer token for v1.1 API calls."""
@@ -748,13 +914,51 @@ class BrinkHomeCloud:
             "Accept": "application/json",
         }
 
+    def _set_token_expiry(self, raw_expires_in: Any) -> int:
+        """Set ``_token_expiry`` from a token response ``expires_in`` value.
+
+        The value is coerced to int; None, invalid or non-positive values
+        fall back to 3599 seconds. The safety margin is ``min(60, n // 2)``
+        so short-lived tokens are not treated as instantly expired.
+
+        Returns:
+            The effective ``expires_in`` in seconds.
+        """
+        expires_in = _DEFAULT_EXPIRES_IN
+        if raw_expires_in is not None and not isinstance(raw_expires_in, bool):
+            try:
+                parsed = int(raw_expires_in)
+            except (TypeError, ValueError, OverflowError):
+                parsed = 0
+            if parsed > 0:
+                expires_in = parsed
+        margin = min(60, expires_in // 2)
+        self._token_expiry = time.monotonic() + expires_in - margin
+        return expires_in
+
+    @staticmethod
+    async def _read_token_json(resp: aiohttp.ClientResponse, what: str) -> dict[str, Any]:
+        """Read a token endpoint body as a JSON object or raise BrinkAuthError."""
+        try:
+            data = await resp.json()
+        except (ValueError, aiohttp.ContentTypeError) as ex:
+            raise BrinkAuthError(f"{what} was not valid JSON") from ex
+        if not isinstance(data, dict):
+            raise BrinkAuthError(f"{what} was not a JSON object")
+        return data
+
     async def _refresh_access_token(self) -> None:
         """Use the refresh token to silently obtain a new access token.
 
-        Raises BrinkAuthError if the refresh fails (token expired/revoked).
-        On failure, clears the stored refresh token so the caller falls
-        back to a full OIDC login.
+        Raises:
+            _RefreshTransientError: network error, timeout or 5xx. The
+                refresh token is kept.
+            BrinkAuthError: the grant was rejected (HTTP 400/401) or the
+                response was unusable; the refresh token is cleared so the
+                caller falls back to a full OIDC login.
         """
+        if self._closed:
+            raise BrinkAuthError("Client is closed")
         if not self._refresh_token:
             raise BrinkAuthError("No refresh token available")
 
@@ -771,35 +975,50 @@ class BrinkHomeCloud:
                     data=token_data,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
-
-                if resp.status != 200:
-                    self._refresh_token = None
-                    await resp.release()
-                    raise BrinkAuthError(
-                        f"Refresh token rejected (HTTP {resp.status})"
-                    )
-
                 try:
-                    token_json = await resp.json()
-                except Exception:
-                    self._refresh_token = None
-                    await resp.release()
-                    raise BrinkAuthError("Refresh response was not valid JSON")
+                    status = resp.status
+                    if status != 200:
+                        if status in (400, 401):
+                            self._refresh_token = None
+                            raise BrinkAuthError(
+                                f"Refresh token rejected (HTTP {status})"
+                            )
+                        # 429 (rate limited) and 5xx are transient: keep the
+                        # refresh token, don't fall back to a password login.
+                        if status >= 500 or status == 429:
+                            raise _RefreshTransientError(
+                                f"Refresh token request failed (HTTP {status})",
+                                aiohttp.ClientError(f"HTTP {status}"),
+                            )
+                        # Other statuses (403, 404, ...): unexpected, keep the
+                        # token but let the caller fall back to a full login.
+                        raise BrinkAuthError(
+                            f"Refresh token request failed (HTTP {status})"
+                        )
 
-                access_token = token_json.get("access_token")
-                if not access_token:
-                    self._refresh_token = None
+                    try:
+                        token_json = await self._read_token_json(
+                            resp, "Refresh response"
+                        )
+                    except BrinkAuthError:
+                        self._refresh_token = None
+                        raise
+
+                    access_token = token_json.get("access_token")
+                    if not access_token:
+                        self._refresh_token = None
+                        raise BrinkAuthError("Refresh response missing access_token")
+                finally:
                     await resp.release()
-                    raise BrinkAuthError("Refresh response missing access_token")
         except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
-            self._refresh_token = None
-            raise BrinkAuthError(
-                f"Refresh token request failed: {type(ex).__name__}"
+            raise _RefreshTransientError(
+                f"Refresh token request failed: {type(ex).__name__}", ex
             ) from ex
 
+        if self._closed:
+            raise BrinkAuthError("Client is closed")
         self._access_token = access_token
-        expires_in: int = token_json.get("expires_in", 3599)
-        self._token_expiry = time.monotonic() + expires_in - 60
+        expires_in = self._set_token_expiry(token_json.get("expires_in"))
 
         # Servers often rotate refresh tokens — store the new one if provided
         new_refresh = token_json.get("refresh_token")
@@ -817,10 +1036,25 @@ class BrinkHomeCloud:
     @staticmethod
     def _parse_uidescription(data: dict[str, Any]) -> dict[str, Any]:
         """Parse the v1.1 uidescription response into components with parameters."""
-        nav_items = data.get("root", {}).get("navigationItems", [])
+        if not isinstance(data, dict):
+            _LOGGER.warning(
+                "Unexpected uidescription response type: %s", type(data).__name__
+            )
+            return {"components": []}
+
+        root = data.get("root", {})
+        nav_items = root.get("navigationItems", []) if isinstance(root, dict) else []
+        if not isinstance(nav_items, list):
+            nav_items = []
 
         components: list[dict[str, Any]] = []
         for nav_item in nav_items:
+            if not isinstance(nav_item, dict):
+                _LOGGER.warning(
+                    "Skipping non-object navigation item (type: %s)",
+                    type(nav_item).__name__,
+                )
+                continue
             parameters: dict[str, dict[str, Any]] = {}
             _extract_parameters(nav_item, parameters)
 
@@ -848,34 +1082,50 @@ class BrinkHomeCloud:
         return extractor.results
 
     @staticmethod
+    def _has_login_form(html: str) -> bool:
+        """Return True if the HTML re-displays the username/password login form."""
+        extractor = _InputFieldExtractor({"__RequestVerificationToken"})
+        try:
+            extractor.feed(html)
+        except Exception:  # noqa: BLE001 - malformed HTML must not mask auth errors
+            return False
+        # The anti-forgery token alone is not enough: consent/MFA/terms
+        # interstitials carry it too. Require a credentials input.
+        return (
+            extractor.has_password_input
+            or "password" in extractor.names_seen
+            or "username" in extractor.names_seen
+        )
+
+    @staticmethod
     def _extract_code_from_redirect(
         url: str, expected_state: str | None = None
     ) -> str | None:
-        """Extract authorization code from redirect URL query string.
+        """Extract authorization code from a redirect URL.
 
-        If expected_state is provided, validates the state parameter to
-        prevent CSRF attacks on the OAuth redirect.
+        The code is looked up in the query string first, then the fragment.
+        URLs without a code (intermediate redirects) return None silently.
+        If a code is found and expected_state is provided, the state is
+        validated from the same component (query or fragment) the code came
+        from, to prevent CSRF attacks on the OAuth redirect.
         """
         try:
             parsed = urlparse(url)
-            params = parse_qs(parsed.query)
+            components = (parse_qs(parsed.query), parse_qs(parsed.fragment))
+        except ValueError:
+            _LOGGER.debug("Error parsing redirect URL for authorization code")
+            return None
 
+        for params in components:
+            codes = params.get("code")
+            if not codes:
+                continue
             if expected_state is not None:
                 returned_states = params.get("state")
                 if not returned_states or returned_states[0] != expected_state:
                     _LOGGER.warning("OAuth state mismatch — possible CSRF attack")
                     return None
-
-            codes = params.get("code")
-            if codes:
-                return codes[0]
-            if parsed.fragment:
-                frag_params = parse_qs(parsed.fragment)
-                codes = frag_params.get("code")
-                if codes:
-                    return codes[0]
-        except (ValueError, KeyError):
-            _LOGGER.debug("Error parsing redirect URL for authorization code")
+            return codes[0]
 
         return None
 
@@ -905,3 +1155,15 @@ class BrinkAuthError(Exception):
     ) -> None:
         super().__init__(message)
         self.is_credentials_error = is_credentials_error
+
+
+class _RefreshTransientError(BrinkAuthError):
+    """Refresh failed for a transient reason (network error, timeout, 5xx).
+
+    The refresh token is kept. ``original`` is the network exception that
+    ``_ensure_token`` re-raises instead of falling back to a password login.
+    """
+
+    def __init__(self, message: str, original: BaseException) -> None:
+        super().__init__(message)
+        self.original = original

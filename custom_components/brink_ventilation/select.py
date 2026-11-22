@@ -49,6 +49,8 @@ class BrinkHomeSelectEntity(BrinkHomeDeviceEntity, SelectEntity):
 
     _optimistic_option: str | None = None
     _write_in_progress: bool = False
+    # True for selects whose user writes supersede a queued controller restore
+    _overrides_controller: bool = False
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -141,6 +143,16 @@ class BrinkHomeSelectEntity(BrinkHomeDeviceEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Set the selected option."""
         value, param = self._validate_for_write(option)
+        if self._overrides_controller:
+            controller = self.coordinator.automation_controller
+            controller.async_user_override()
+            if (
+                controller.state == AutomationState.BOOSTED
+                and not controller.adaptive_active
+            ):
+                # An explicit mode choice ends a boost started outside adaptive
+                # mode, without restoring the pre-boost state over it
+                await controller.async_deactivate()
         self._optimistic_option = option
         self._write_in_progress = True
         self.async_write_ha_state()
@@ -154,6 +166,7 @@ class BrinkHomeModeSelectEntity(BrinkHomeSelectEntity):
     """Representation of the Brink operating mode select."""
 
     _attr_translation_key = "operating_mode"
+    _overrides_controller = True
     _value_map = OPERATING_MODE_MAP
     _reverse_map = OPERATING_MODE_REVERSE
 
@@ -196,7 +209,7 @@ class BrinkHomeVentilationLevelSelectEntity(BrinkHomeSelectEntity):
         if self._optimistic_option is not None:
             return self._optimistic_option
         controller = self.coordinator.automation_controller
-        if controller.state != AutomationState.IDLE:
+        if controller.adaptive_active:
             return "adaptive"
         # Fall back to normal API-based value
         param = self._param
@@ -255,12 +268,15 @@ class BrinkHomeVentilationLevelSelectEntity(BrinkHomeSelectEntity):
                 self._write_in_progress = False
             return
 
-        # If switching away from adaptive mode, deactivate controller
+        # Validate first so a failure does not leave adaptive mode switched off
+        value, vent_param = self._validate_for_write(option)
+
+        # The user's choice supersedes any queued controller restore
+        controller.async_user_override()
+
+        # If switching away from adaptive mode (or a boost), deactivate controller
         if controller.state != AutomationState.IDLE:
             await controller.async_deactivate()
-
-        # Original logic for levels 0-3
-        value, vent_param = self._validate_for_write(option)
 
         self._optimistic_option = option
         self._write_in_progress = True

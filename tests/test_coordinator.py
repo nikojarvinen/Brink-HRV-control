@@ -21,6 +21,10 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from custom_components.brink_ventilation.const import (
+    CONNECTION_STATUS_AUTH_ERROR,
+    CONNECTION_STATUS_CONNECTED,
+    CONNECTION_STATUS_SERVER_ERROR,
+    CONNECTION_STATUS_UNKNOWN_ERROR,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EXPEDITED_DURATION,
@@ -76,6 +80,7 @@ def _make_mock_client(
     """Return a fully mocked BrinkHomeCloud instance."""
     client = AsyncMock()
     client.login = AsyncMock(side_effect=login_side_effect)
+    client.async_invalidate_token = AsyncMock(return_value=None)
 
     if get_systems_side_effect is not None:
         client.get_systems = AsyncMock(side_effect=get_systems_side_effect)
@@ -153,17 +158,31 @@ async def test_coordinator_fetch_success(hass: HomeAssistant) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_coordinator_fetch_auth_error(hass: HomeAssistant) -> None:
-    """Test that BrinkAuthError raises ConfigEntryAuthFailed."""
+async def test_coordinator_fetch_auth_error_credentials(hass: HomeAssistant) -> None:
+    """A definite credentials error raises ConfigEntryAuthFailed."""
     mock_client = _make_mock_client(
         get_systems_side_effect=BrinkAuthError(
-            "Token expired", is_credentials_error=False
+            "Invalid username or password", is_credentials_error=True
         ),
     )
     coordinator = await _setup_coordinator(hass, mock_client)
 
     with pytest.raises(ConfigEntryAuthFailed):
         await coordinator._async_update_data()
+
+
+async def test_coordinator_fetch_auth_error_transient(hass: HomeAssistant) -> None:
+    """A non-credentials auth error raises UpdateFailed (polling continues)."""
+    mock_client = _make_mock_client(
+        get_systems_side_effect=BrinkAuthError(
+            "Authentication on cooldown", is_credentials_error=False
+        ),
+    )
+    coordinator = await _setup_coordinator(hass, mock_client)
+
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
+    assert coordinator.connection_status == CONNECTION_STATUS_AUTH_ERROR
 
 
 async def test_coordinator_fetch_client_error(hass: HomeAssistant) -> None:
@@ -210,7 +229,7 @@ async def test_coordinator_fetch_server_error(hass: HomeAssistant) -> None:
 
 
 async def test_coordinator_401_retry_success(hass: HomeAssistant) -> None:
-    """Test that a 401 triggers re-login and a successful retry."""
+    """Test that a 401 invalidates the token and retries successfully."""
     mock_client = _make_mock_client()
 
     # First call to get_systems raises 401, second succeeds
@@ -234,23 +253,27 @@ async def test_coordinator_401_retry_success(hass: HomeAssistant) -> None:
     data = await coordinator._async_update_data()
 
     assert SYSTEM_ID in data
-    mock_client.login.assert_awaited_once()
+    mock_client.async_invalidate_token.assert_awaited_once()
+    mock_client.login.assert_not_awaited()
     # get_systems called twice (initial 401 + retry)
     assert mock_client.get_systems.await_count == 2
 
 
-async def test_coordinator_401_retry_fails_auth(hass: HomeAssistant) -> None:
-    """Test that 401 + re-login BrinkAuthError raises ConfigEntryAuthFailed."""
-    mock_client = _make_mock_client(
-        login_side_effect=BrinkAuthError("Credentials invalid"),
-    )
+async def test_coordinator_401_retry_fails_auth_credentials(
+    hass: HomeAssistant,
+) -> None:
+    """401 + retry BrinkAuthError(credentials) raises ConfigEntryAuthFailed."""
+    mock_client = _make_mock_client()
     mock_client.get_systems = AsyncMock(
-        side_effect=aiohttp.ClientResponseError(
-            request_info=MagicMock(),
-            history=(),
-            status=401,
-            message="Unauthorized",
-        ),
+        side_effect=[
+            aiohttp.ClientResponseError(
+                request_info=MagicMock(),
+                history=(),
+                status=401,
+                message="Unauthorized",
+            ),
+            BrinkAuthError("Credentials invalid", is_credentials_error=True),
+        ],
     )
 
     coordinator = await _setup_coordinator(hass, mock_client)
@@ -258,11 +281,37 @@ async def test_coordinator_401_retry_fails_auth(hass: HomeAssistant) -> None:
     with pytest.raises(ConfigEntryAuthFailed, match="Re-authentication failed"):
         await coordinator._async_update_data()
 
-    mock_client.login.assert_awaited_once()
+    mock_client.async_invalidate_token.assert_awaited_once()
+    mock_client.login.assert_not_awaited()
+
+
+async def test_coordinator_401_retry_fails_auth_transient(
+    hass: HomeAssistant,
+) -> None:
+    """401 + retry BrinkAuthError(non-credentials) raises UpdateFailed."""
+    mock_client = _make_mock_client()
+    mock_client.get_systems = AsyncMock(
+        side_effect=[
+            aiohttp.ClientResponseError(
+                request_info=MagicMock(),
+                history=(),
+                status=401,
+                message="Unauthorized",
+            ),
+            BrinkAuthError("Authentication on cooldown"),
+        ],
+    )
+
+    coordinator = await _setup_coordinator(hass, mock_client)
+
+    with pytest.raises(UpdateFailed, match="Re-authentication failed"):
+        await coordinator._async_update_data()
+
+    assert coordinator.connection_status == CONNECTION_STATUS_AUTH_ERROR
 
 
 async def test_coordinator_401_retry_still_401(hass: HomeAssistant) -> None:
-    """Test that 401 + login OK + still 401 raises ConfigEntryAuthFailed."""
+    """Test that 401 + invalidate OK + still 401 raises ConfigEntryAuthFailed."""
     mock_client = _make_mock_client()
 
     # Both get_systems calls return 401
@@ -280,7 +329,7 @@ async def test_coordinator_401_retry_still_401(hass: HomeAssistant) -> None:
     with pytest.raises(ConfigEntryAuthFailed, match="HTTP 401"):
         await coordinator._async_update_data()
 
-    mock_client.login.assert_awaited_once()
+    mock_client.async_invalidate_token.assert_awaited_once()
 
 
 async def test_coordinator_401_retry_connection_error(
@@ -436,6 +485,39 @@ async def test_update_scan_interval(hass: HomeAssistant) -> None:
     assert coordinator.update_interval == timedelta(seconds=120)
 
 
+async def test_update_scan_interval_unchanged_is_noop(hass: HomeAssistant) -> None:
+    """Same interval (e.g. adaptive_active option write) does not poll."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+
+    with patch.object(
+        coordinator, "async_request_refresh", new_callable=AsyncMock
+    ) as mock_refresh:
+        await coordinator.async_update_scan_interval(DEFAULT_SCAN_INTERVAL)
+
+    mock_refresh.assert_not_awaited()
+    assert coordinator.update_interval == timedelta(seconds=DEFAULT_SCAN_INTERVAL)
+
+
+async def test_update_scan_interval_unchanged_during_expedited_is_noop(
+    hass: HomeAssistant,
+) -> None:
+    """During expedited polling, compare against the saved normal interval."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    coordinator.start_expedited_polling()
+
+    with patch.object(
+        coordinator, "async_request_refresh", new_callable=AsyncMock
+    ) as mock_refresh:
+        await coordinator.async_update_scan_interval(DEFAULT_SCAN_INTERVAL)
+
+    mock_refresh.assert_not_awaited()
+    assert coordinator._expedited_normal_interval == timedelta(
+        seconds=DEFAULT_SCAN_INTERVAL
+    )
+    assert coordinator.update_interval == timedelta(seconds=EXPEDITED_INTERVAL)
+    coordinator.cancel_expedited_polling()
+
+
 async def test_update_scan_interval_during_expedited(
     hass: HomeAssistant,
 ) -> None:
@@ -563,3 +645,138 @@ async def test_fetch_devices_empty_systems(hass: HomeAssistant) -> None:
     data = await coordinator._async_update_data()
 
     assert data == {}
+
+
+
+# ---------------------------------------------------------------------------
+# Stale data / controller isolation
+# ---------------------------------------------------------------------------
+
+
+async def test_controller_sees_fresh_data(hass: HomeAssistant) -> None:
+    """coordinator.data is the new poll when the controller is notified."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    assert coordinator.data is None
+    seen: list[Any] = []
+
+    async def _capture() -> None:
+        seen.append(coordinator.data)
+
+    coordinator.automation_controller.async_on_coordinator_update = AsyncMock(
+        side_effect=_capture
+    )
+
+    data = await coordinator._async_update_data()
+
+    assert seen == [data]
+    assert SYSTEM_ID in seen[0]
+
+
+async def test_controller_exception_does_not_fail_poll(
+    hass: HomeAssistant,
+) -> None:
+    """A controller bug must not turn a successful poll into a failure."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    coordinator.automation_controller.async_on_coordinator_update = AsyncMock(
+        side_effect=RuntimeError("controller bug")
+    )
+
+    data = await coordinator._async_update_data()
+
+    assert SYSTEM_ID in data
+    assert coordinator.connection_status == CONNECTION_STATUS_CONNECTED
+    assert coordinator.consecutive_errors == 0
+
+
+async def test_controller_cancelled_error_propagates(hass: HomeAssistant) -> None:
+    """CancelledError from the controller is not swallowed."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    coordinator.automation_controller.async_on_coordinator_update = AsyncMock(
+        side_effect=asyncio.CancelledError()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator._async_update_data()
+
+
+# ---------------------------------------------------------------------------
+# Status recording for UpdateFailed / unexpected errors
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_all_systems_failed_records_server_error(
+    hass: HomeAssistant,
+) -> None:
+    """UpdateFailed from _fetch_devices is recorded as a server error."""
+    mock_client = _make_mock_client(
+        get_device_data_side_effect=aiohttp.ClientError("boom"),
+    )
+    coordinator = await _setup_coordinator(hass, mock_client)
+
+    with pytest.raises(UpdateFailed, match="all 1 systems"):
+        await coordinator._async_update_data()
+
+    assert coordinator.connection_status == CONNECTION_STATUS_SERVER_ERROR
+    assert coordinator.consecutive_errors == 1
+    assert "all 1 systems" in (coordinator.last_error_message or "")
+
+
+async def test_unexpected_exception_records_unknown_error(
+    hass: HomeAssistant,
+) -> None:
+    """Any other exception becomes UpdateFailed with unknown_error status."""
+    mock_client = _make_mock_client(
+        get_systems_side_effect=ValueError("bad payload"),
+    )
+    coordinator = await _setup_coordinator(hass, mock_client)
+
+    with pytest.raises(UpdateFailed, match="bad payload") as exc_info:
+        await coordinator._async_update_data()
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert coordinator.connection_status == CONNECTION_STATUS_UNKNOWN_ERROR
+    assert coordinator.consecutive_errors == 1
+
+
+async def test_last_successful_poll_is_timezone_aware(hass: HomeAssistant) -> None:
+    """last_successful_poll uses tz-aware UTC time."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+
+    await coordinator._async_update_data()
+
+    assert coordinator.last_successful_poll is not None
+    assert coordinator.last_successful_poll.tzinfo is not None
+    assert coordinator.last_successful_poll.utcoffset() == timedelta(0)
+
+
+# ---------------------------------------------------------------------------
+# Expedited polling reschedules the pending refresh
+# ---------------------------------------------------------------------------
+
+
+async def test_expedited_polling_reschedules_with_listeners(
+    hass: HomeAssistant,
+) -> None:
+    """With listeners, starting expedited polling reschedules the refresh."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    remove = coordinator.async_add_listener(lambda: None)
+    try:
+        with patch.object(coordinator, "_schedule_refresh") as mock_schedule:
+            coordinator.start_expedited_polling()
+        mock_schedule.assert_called_once()
+        assert coordinator.update_interval == timedelta(seconds=EXPEDITED_INTERVAL)
+    finally:
+        coordinator.cancel_expedited_polling()
+        remove()
+        await coordinator.async_shutdown()
+
+
+async def test_expedited_polling_no_reschedule_without_listeners(
+    hass: HomeAssistant,
+) -> None:
+    """Without listeners nothing is scheduled."""
+    coordinator = await _setup_coordinator(hass, _make_mock_client())
+    with patch.object(coordinator, "_schedule_refresh") as mock_schedule:
+        coordinator.start_expedited_polling()
+    mock_schedule.assert_not_called()
+    coordinator.cancel_expedited_polling()

@@ -194,6 +194,8 @@ The **Extra ventilation** switch activates a timed ventilation boost. When turne
 4. The device is switched to Manual mode and the boost runs for the configured duration.
 5. After the timer expires, ventilation returns to the previous state.
 
+An active boost survives a Home Assistant restart: the remaining time resumes, and if the boost ended while Home Assistant was down, the previous state is restored at startup — unless the unit's mode or level was changed in the meantime (e.g. from the Brink app), in which case your change is kept.
+
 The winter/summer split exists because Brink ventilation units have a preheater that prevents freezing of the heat exchanger. At high flow rates in freezing conditions, the preheater uses significant electricity. Setting a lower max level in winter avoids this.
 
 ### Boost Trigger Attribution

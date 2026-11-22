@@ -17,6 +17,7 @@ from homeassistant.helpers.device_registry import DeviceEntry
 
 _LOGGER = logging.getLogger(__name__)
 
+from .automation_controller import boost_store
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
 from .coordinator import BrinkDataCoordinator
 from .core.brink_home_cloud import BrinkAuthError, BrinkHomeCloud
@@ -107,7 +108,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrinkConfigEntry) -> boo
         await brink_client.login()
     except BrinkAuthError as ex:
         await brink_client.close()
-        raise ConfigEntryAuthFailed from ex
+        if ex.is_credentials_error:
+            raise ConfigEntryAuthFailed from ex
+        raise ConfigEntryNotReady from ex
     except aiohttp.ClientResponseError as ex:
         await brink_client.close()
         if ex.status == 401:
@@ -117,6 +120,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrinkConfigEntry) -> boo
         await brink_client.close()
         raise ConfigEntryNotReady from ex
 
+    coordinator: BrinkDataCoordinator | None = None
     try:
         coordinator = BrinkDataCoordinator(hass, brink_client, entry)
         await coordinator.async_config_entry_first_refresh()
@@ -127,6 +131,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: BrinkConfigEntry) -> boo
         # Start humidity monitoring (delta sensors) regardless of automation state
         await coordinator.automation_controller.async_start_humidity_monitoring()
     except Exception:
+        # Stop timers the controller/coordinator may already have started so
+        # they don't keep firing against a closed client.
+        if coordinator is not None:
+            try:
+                await coordinator.automation_controller.async_cleanup()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Automation cleanup failed during setup abort", exc_info=True)
+            try:
+                coordinator.cancel_expedited_polling()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Expedited polling cancel failed during setup abort", exc_info=True)
         await brink_client.close()
         raise
 
@@ -169,6 +184,14 @@ async def async_unload_entry(
         await entry.runtime_data.client.close()
 
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BrinkConfigEntry) -> None:
+    """Delete persisted boost state when the config entry is removed."""
+    try:
+        await boost_store(hass, entry.entry_id).async_remove()
+    except Exception:  # noqa: BLE001
+        _LOGGER.debug("Could not remove persisted boost state", exc_info=True)
 
 
 async def async_remove_config_entry_device(

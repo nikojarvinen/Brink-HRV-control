@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 
 import aiohttp
 
@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONNECTION_STATUS_AUTH_ERROR,
@@ -62,6 +63,7 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name=DOMAIN,
             update_interval=timedelta(seconds=scan_interval),
         )
@@ -77,35 +79,47 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
         self.last_error_message: str | None = None
         self.consecutive_errors: int = 0
 
+    def _handle_auth_error(self, ex: BrinkAuthError, context: str) -> NoReturn:
+        """Record an auth error and raise the appropriate HA exception.
+
+        Only definite credential errors raise ConfigEntryAuthFailed (which
+        starts reauth and permanently stops polling).  Anything else (server
+        hiccup, CSRF/maintenance page, client-side cooldown) is transient and
+        raises UpdateFailed so polling continues.
+        """
+        self._record_error(CONNECTION_STATUS_AUTH_ERROR, str(ex))
+        if ex.is_credentials_error:
+            _LOGGER.warning(
+                "Brink %s failed: %s — "
+                "check Settings > Devices & Services > Brink Ventilation "
+                "for re-authentication",
+                context,
+                ex,
+            )
+            raise ConfigEntryAuthFailed(f"{context.capitalize()} failed: {ex}") from ex
+        _LOGGER.warning(
+            "Brink %s failed (will retry on next poll): %s", context, ex
+        )
+        raise UpdateFailed(f"{context.capitalize()} failed: {ex}") from ex
+
     async def _async_update_data(self) -> dict[int, dict[str, Any]]:
         """Fetch data from Brink Home API."""
         try:
             data = await self._fetch_devices()
         except BrinkAuthError as ex:
-            self._record_error(CONNECTION_STATUS_AUTH_ERROR, str(ex))
-            _LOGGER.warning(
-                "Brink authentication failed: %s — "
-                "check Settings > Devices & Services > Brink Ventilation "
-                "for re-authentication",
-                ex,
-            )
-            raise ConfigEntryAuthFailed(f"Authentication failed: {ex}") from ex
+            self._handle_auth_error(ex, "authentication")
         except aiohttp.ClientResponseError as ex:
             if ex.status == 401:
                 _LOGGER.debug(
                     "Brink API returned 401, attempting re-authentication"
                 )
                 try:
-                    await self.client.login()
+                    # Expire the token under the client's auth lock; the fetch
+                    # re-authenticates (with the client's backoff) as needed.
+                    await self.client.async_invalidate_token()
                     data = await self._fetch_devices()
                 except BrinkAuthError as retry_ex:
-                    self._record_error(CONNECTION_STATUS_AUTH_ERROR, str(retry_ex))
-                    _LOGGER.warning(
-                        "Brink re-authentication failed: %s", retry_ex
-                    )
-                    raise ConfigEntryAuthFailed(
-                        f"Re-authentication failed: {retry_ex}"
-                    ) from retry_ex
+                    self._handle_auth_error(retry_ex, "re-authentication")
                 except aiohttp.ClientResponseError as retry_ex:
                     if retry_ex.status == 401:
                         self._record_error(CONNECTION_STATUS_AUTH_ERROR, str(retry_ex))
@@ -136,6 +150,9 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
                     raise UpdateFailed(
                         f"Connection lost during re-auth: {retry_ex}"
                     ) from retry_ex
+                except UpdateFailed as retry_ex:
+                    self._record_error(CONNECTION_STATUS_SERVER_ERROR, str(retry_ex))
+                    raise
             else:
                 self._record_error(
                     CONNECTION_STATUS_SERVER_ERROR,
@@ -153,15 +170,35 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
             await self._record_connectivity_error(ex)
             _LOGGER.warning("Cannot reach Brink Home portal: %s", ex)
             raise UpdateFailed(f"Connection error: {ex}") from ex
+        except UpdateFailed as ex:
+            self._record_error(CONNECTION_STATUS_SERVER_ERROR, str(ex))
+            raise
+        except Exception as ex:
+            self._record_error(CONNECTION_STATUS_UNKNOWN_ERROR, str(ex))
+            _LOGGER.warning(
+                "Unexpected error fetching Brink data (%s): %s",
+                type(ex).__name__,
+                ex,
+            )
+            raise UpdateFailed(f"Unexpected error: {ex}") from ex
 
         # Success — reset error tracking
         self.connection_status = CONNECTION_STATUS_CONNECTED
-        self.last_successful_poll = datetime.now()
+        self.last_successful_poll = dt_util.utcnow()
         self.last_error_message = None
         self.consecutive_errors = 0
 
-        # Notify automation controller of fresh data
-        await self.automation_controller.async_on_coordinator_update()
+        # HA only assigns self.data after this method returns, but the
+        # automation controller reads coordinator.data.  Assign it now so the
+        # controller sees the fresh poll rather than the previous one.
+        self.data = data
+
+        # Notify automation controller of fresh data.  A controller bug must
+        # not turn a successful poll into a failed one.
+        try:
+            await self.automation_controller.async_on_coordinator_update()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Automation controller failed after coordinator update")
         return data
 
     def _record_error(self, status: str, message: str) -> None:
@@ -256,6 +293,10 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
             self._expedited_normal_interval = self.update_interval
 
         self.update_interval = timedelta(seconds=EXPEDITED_INTERVAL)
+        # Changing update_interval does not affect the already-scheduled
+        # refresh; reschedule so the short interval applies immediately.
+        if self._listeners:
+            self._schedule_refresh()
         _LOGGER.debug(
             "Expedited polling started (every %ss for %ss)",
             EXPEDITED_INTERVAL,
@@ -288,6 +329,16 @@ class BrinkDataCoordinator(DataUpdateCoordinator[dict[int, dict[str, Any]]]):
     async def async_update_scan_interval(self, new_interval: int) -> None:
         """Update the scan interval, respecting expedited polling state."""
         new_td = timedelta(seconds=new_interval)
+        current = (
+            self._expedited_normal_interval
+            if self._expedited_normal_interval is not None
+            else self.update_interval
+        )
+        if new_td == current:
+            _LOGGER.debug(
+                "Scan interval unchanged (%ss), skipping refresh", new_interval
+            )
+            return
         if self._expedited_normal_interval is not None:
             self._expedited_normal_interval = new_td
             _LOGGER.info(

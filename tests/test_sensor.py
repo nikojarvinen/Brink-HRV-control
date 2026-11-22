@@ -252,19 +252,11 @@ async def test_current_season_sensor(hass: HomeAssistant, setup_integration) -> 
     entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_current_season")
     state = hass.states.get(entity_id)
     assert state is not None
-    # After setup, the coordinator has done its first refresh.
-    # The season is evaluated from fresh_air_temp (15.0C) which is above
-    # the default freezing threshold (-2.0C), so season should be summer.
-    # However, if automation is IDLE, season evaluation only runs during
-    # async_on_coordinator_update which is called during refresh.
-    # The season property returns self._season from the automation controller.
-    # Since the integration was set up and first refresh happened, season
-    # should have been evaluated.
-    # With CONF_ADAPTIVE_ACTIVE=False, the controller stays IDLE.
-    # In IDLE state, async_on_coordinator_update returns early without
-    # evaluating season, so _season remains None -> HA shows "unknown".
-    # Season is only actively evaluated when adaptive mode is activated.
-    assert state.state == "unknown"
+    # After setup, the coordinator has done its first refresh. Season is
+    # evaluated on every refresh regardless of automation state (IDLE here),
+    # using the fresh poll data: fresh_air_temp 15.0C is above the default
+    # freezing threshold (-2.0C), so the season is summer.
+    assert state.state == "summer"
 
 
 def _make_heat_recovery_entry(**extra_options: Any) -> MockConfigEntry:
@@ -498,3 +490,133 @@ async def test_humidity_delta_sensor_with_configured_sensor(
     assert state.state != "unavailable"
     # The delta starts at 0.0 since there's only one reading
     assert float(state.state) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Robustness: invalid API values and indoor temperature units
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_value", ["abc", "nan", "inf", "-inf", ""])
+async def test_numeric_sensor_invalid_value_is_unknown(
+    hass: HomeAssistant, mock_brink_cloud, mock_config_entry, bad_value: str
+) -> None:
+    """Non-numeric / non-finite API values yield an unknown state, not an error."""
+    data = build_coordinator_data(supply_air_flow=bad_value, fresh_air_temp=bad_value)
+    mock_brink_cloud.get_device_data = AsyncMock(return_value=data[SYSTEM_ID])
+    mock_config_entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.brink_ventilation.BrinkHomeCloud",
+        return_value=mock_brink_cloud,
+    ):
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    for key in ("supply_air_flow", "fresh_air_temp"):
+        entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_{key}")
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == "unknown"
+
+
+async def test_enum_sensor_unknown_value_is_unknown(
+    hass: HomeAssistant, mock_brink_cloud, mock_config_entry
+) -> None:
+    """Enum values missing from the map yield an unknown state."""
+    data = build_coordinator_data(bypass_valve_status="99", preheater_status="77")
+    mock_brink_cloud.get_device_data = AsyncMock(return_value=data[SYSTEM_ID])
+    mock_config_entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.brink_ventilation.BrinkHomeCloud",
+        return_value=mock_brink_cloud,
+    ):
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    for key in ("bypass_valve_status", "preheater_status"):
+        entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_{key}")
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == "unknown"
+
+
+async def _heat_recovery_state(
+    hass: HomeAssistant,
+    mock_brink_cloud,
+    indoor_state: str,
+    indoor_attrs: dict[str, Any] | None = None,
+    **data_kwargs: str,
+) -> str:
+    """Set up the integration and return the heat recovery efficiency state."""
+    entry = _make_heat_recovery_entry()
+    data = build_coordinator_data(**data_kwargs)
+    mock_brink_cloud.get_device_data = AsyncMock(return_value=data[SYSTEM_ID])
+    entry.add_to_hass(hass)
+    hass.states.async_set("sensor.indoor_temp", indoor_state, indoor_attrs or {})
+
+    with patch(
+        "custom_components.brink_ventilation.BrinkHomeCloud",
+        return_value=mock_brink_cloud,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    entity_id = _get_entity_id(hass, f"{DOMAIN}_{SYSTEM_ID}_heat_recovery_efficiency")
+    state = hass.states.get(entity_id)
+    assert state is not None
+    return state.state
+
+
+async def test_heat_recovery_indoor_fahrenheit_converted(
+    hass: HomeAssistant, mock_brink_cloud
+) -> None:
+    """Indoor temperature reported in degrees F is converted to Celsius."""
+    result = await _heat_recovery_state(
+        hass,
+        mock_brink_cloud,
+        "71.6",  # 22 C
+        {"unit_of_measurement": "°F"},
+        supply_temp="20.0",
+        fresh_air_temp="5.0",
+        bypass_valve_status="4",
+    )
+    assert abs(float(result) - 88.2) < 0.2
+
+
+async def test_heat_recovery_indoor_celsius_unit_unchanged(
+    hass: HomeAssistant, mock_brink_cloud
+) -> None:
+    """Indoor temperature explicitly in degrees C is used as-is."""
+    result = await _heat_recovery_state(
+        hass,
+        mock_brink_cloud,
+        "22.0",
+        {"unit_of_measurement": "°C"},
+        supply_temp="20.0",
+        fresh_air_temp="5.0",
+        bypass_valve_status="4",
+    )
+    assert abs(float(result) - 88.2) < 0.2
+
+
+@pytest.mark.parametrize("indoor", ["nan", "inf"])
+async def test_heat_recovery_indoor_non_finite_ignored(
+    hass: HomeAssistant, mock_brink_cloud, indoor: str
+) -> None:
+    """Non-finite indoor temperatures are skipped."""
+    result = await _heat_recovery_state(
+        hass, mock_brink_cloud, indoor, supply_temp="20.0", fresh_air_temp="5.0"
+    )
+    assert result == "unknown"
+
+
+@pytest.mark.parametrize("field", ["supply_temp", "fresh_air_temp"])
+async def test_heat_recovery_non_finite_brink_temp(
+    hass: HomeAssistant, mock_brink_cloud, field: str
+) -> None:
+    """Non-finite Brink supply/fresh temperatures give an unknown state."""
+    kwargs = {"supply_temp": "20.0", "fresh_air_temp": "5.0", field: "nan"}
+    result = await _heat_recovery_state(hass, mock_brink_cloud, "22.0", **kwargs)
+    assert result == "unknown"

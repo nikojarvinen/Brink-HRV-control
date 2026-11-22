@@ -67,6 +67,7 @@ def _make_mock_client(
     """Return a fully mocked BrinkHomeCloud instance."""
     client = AsyncMock()
     client.login = AsyncMock(side_effect=login_side_effect)
+    client.async_invalidate_token = AsyncMock(return_value=None)
     client.get_systems = AsyncMock(
         return_value=[
             {
@@ -125,6 +126,100 @@ async def test_setup_entry_auth_failure(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
 
     assert entry.state is ConfigEntryState.SETUP_ERROR
+    mock_client.close.assert_awaited_once()
+
+
+async def test_setup_entry_transient_auth_error_is_not_ready(
+    hass: HomeAssistant,
+) -> None:
+    """Non-credentials BrinkAuthError during login retries (SETUP_RETRY)."""
+    entry = _make_config_entry()
+    entry.add_to_hass(hass)
+    mock_client = _make_mock_client(
+        login_side_effect=BrinkAuthError(
+            "CSRF token missing", is_credentials_error=False
+        ),
+    )
+
+    with patch(
+        "custom_components.brink_ventilation.BrinkHomeCloud",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    mock_client.close.assert_awaited_once()
+
+
+async def test_setup_entry_cleanup_on_failure_after_coordinator(
+    hass: HomeAssistant,
+) -> None:
+    """A failure after coordinator creation cleans up controller and timers."""
+    entry = _make_config_entry()
+    entry.add_to_hass(hass)
+    mock_client = _make_mock_client()
+
+    with (
+        patch(
+            "custom_components.brink_ventilation.BrinkHomeCloud",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.brink_ventilation.BrinkDataCoordinator"
+        ) as mock_coord_cls,
+    ):
+        mock_coord = mock_coord_cls.return_value
+        mock_coord.async_config_entry_first_refresh = AsyncMock()
+        mock_coord.automation_controller.async_restore_state = AsyncMock()
+        mock_coord.automation_controller.async_start_humidity_monitoring = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        mock_coord.automation_controller.async_cleanup = AsyncMock()
+        mock_coord.cancel_expedited_polling = MagicMock()
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    mock_coord.automation_controller.async_cleanup.assert_awaited_once()
+    mock_coord.cancel_expedited_polling.assert_called_once()
+    mock_client.close.assert_awaited_once()
+
+
+async def test_setup_entry_cleanup_errors_do_not_mask_original(
+    hass: HomeAssistant,
+) -> None:
+    """Cleanup failures are swallowed and the client is still closed."""
+    entry = _make_config_entry()
+    entry.add_to_hass(hass)
+    mock_client = _make_mock_client()
+
+    with (
+        patch(
+            "custom_components.brink_ventilation.BrinkHomeCloud",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.brink_ventilation.BrinkDataCoordinator"
+        ) as mock_coord_cls,
+    ):
+        mock_coord = mock_coord_cls.return_value
+        mock_coord.async_config_entry_first_refresh = AsyncMock(
+            side_effect=RuntimeError("first refresh failed")
+        )
+        mock_coord.automation_controller.async_cleanup = AsyncMock(
+            side_effect=RuntimeError("cleanup failed")
+        )
+        mock_coord.cancel_expedited_polling = MagicMock(
+            side_effect=RuntimeError("cancel failed")
+        )
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    mock_coord.cancel_expedited_polling.assert_called_once()
     mock_client.close.assert_awaited_once()
 
 
@@ -239,6 +334,29 @@ async def test_unload_entry(hass: HomeAssistant) -> None:
 
     assert entry.state is ConfigEntryState.NOT_LOADED
     mock_client.close.assert_awaited()
+
+
+async def test_remove_entry_deletes_persisted_boost(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Removing the config entry deletes its persisted boost state file."""
+    entry = _make_config_entry()
+    entry.add_to_hass(hass)
+    key = f"{DOMAIN}.{entry.entry_id}.boost"
+    hass_storage[key] = {"version": 1, "minor_version": 1, "key": key, "data": {}}
+    mock_client = _make_mock_client()
+
+    with patch(
+        "custom_components.brink_ventilation.BrinkHomeCloud",
+        return_value=mock_client,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert key not in hass_storage
 
 
 # ---------------------------------------------------------------------------
