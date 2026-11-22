@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import time
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlunsplit, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlunsplit, urlparse
 
 import aiohttp
 
@@ -22,6 +23,7 @@ from ..const import (
     OIDC_SCOPE,
     OIDC_TOKEN_URL,
     PARAM_NAME_MAP,
+    SIGNALR_HUB_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,6 +32,12 @@ _TRUSTED_HOST = "www.brink-home.com"
 
 # valueState enum used in the v1.1 write payload (matches the SPA)
 _VALUE_STATE_OK = 0
+
+# SignalR JSON hub protocol: every message ends with the record separator
+_SIGNALR_RS = "\x1e"
+_SIGNALR_INVOCATION = 1
+_SIGNALR_COMPLETION = 3
+_SIGNALR_CLOSE = 7
 
 # HTTP statuses treated as redirects in the OIDC flow
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
@@ -122,6 +130,62 @@ class _InputFieldExtractor(HTMLParser):
             self.has_password_input = True
         if name in self._targets and "value" in attr_dict:
             self.results[name] = attr_dict["value"]
+
+
+class _SignalRReader:
+    """Split SignalR text frames into JSON messages."""
+
+    def __init__(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._ws = ws
+        self._pending: list[str] = []
+
+    async def next_message(self) -> dict[str, Any] | None:
+        """Return the next hub message, or None once the socket is closing."""
+        while not self._pending:
+            frame = await self._ws.receive()
+            if frame.type == aiohttp.WSMsgType.TEXT:
+                self._pending = [
+                    rec for rec in str(frame.data).split(_SIGNALR_RS) if rec
+                ]
+            elif frame.type in (
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.ERROR,
+            ):
+                return None
+        try:
+            msg = json.loads(self._pending.pop(0))
+        except ValueError:
+            return {}
+        return msg if isinstance(msg, dict) else {}
+
+    async def invoke(
+        self, invocation_id: str, target: str, arguments: list[Any]
+    ) -> None:
+        """Invoke a hub method and wait for its completion message."""
+        await self._ws.send_str(
+            json.dumps(
+                {
+                    "type": _SIGNALR_INVOCATION,
+                    "invocationId": invocation_id,
+                    "target": target,
+                    "arguments": arguments,
+                }
+            )
+            + _SIGNALR_RS
+        )
+        while True:
+            msg = await self.next_message()
+            if msg is None or msg.get("type") == _SIGNALR_CLOSE:
+                raise BrinkRefreshError(f"SignalR connection closed during {target}")
+            if (
+                msg.get("type") == _SIGNALR_COMPLETION
+                and msg.get("invocationId") == invocation_id
+            ):
+                if msg.get("error"):
+                    raise BrinkRefreshError(f"SignalR {target} was rejected")
+                return
 
 
 class BrinkHomeCloud:
@@ -385,6 +449,117 @@ class BrinkHomeCloud:
                 "re-authentication — credentials may have changed"
             )
             raise BrinkAuthError("Write failed: persistent 401 after re-auth")
+
+    async def refresh_parameter_values(
+        self,
+        system_id: int,
+        value_ids: list[int],
+        # Keep below ~30 s: the client sends no SignalR pings, and hubs drop
+        # silent clients after their client timeout (30 s by default).
+        hold_seconds: float = 20.0,
+    ) -> None:
+        """Ask the cloud to read fresh values for the given parameters.
+
+        Some parameters (e.g. days since filter reset) are only read from the
+        unit while a client is subscribed to them on the web app's SignalR
+        hub; otherwise the REST uidescription keeps returning the last cached
+        value. This connects to the hub, subscribes to ``value_ids`` for
+        ``hold_seconds`` so the cloud reads them from the unit, then
+        unsubscribes and disconnects. The next regular poll picks the new
+        values up.
+
+        Raises:
+            ValueError: on non-integer ids.
+            BrinkRefreshError: if the hub rejects the handshake or a call.
+            aiohttp.ClientError / TimeoutError: on network problems.
+        """
+        if not isinstance(system_id, int) or isinstance(system_id, bool):
+            raise ValueError(
+                f"system_id must be an integer, got {type(system_id).__name__}"
+            )
+        ids: list[int] = []
+        for vid in value_ids:
+            if not isinstance(vid, int) or isinstance(vid, bool):
+                raise ValueError(
+                    f"value_id must be an integer, got {type(vid).__name__}"
+                )
+            if vid not in ids:
+                ids.append(vid)
+        if not ids:
+            return
+
+        await self._ensure_token()
+        token_used = self._access_token
+        headers = self._bearer_headers()
+
+        negotiate: Any = None
+        unauthorized = False
+        async with asyncio.timeout(20):
+            resp = await self._session.post(
+                f"{SIGNALR_HUB_URL}/negotiate?negotiateVersion=1",
+                headers=headers,
+            )
+            try:
+                if resp.status == 401:
+                    unauthorized = True
+                else:
+                    resp.raise_for_status()
+                    negotiate = await resp.json()
+            finally:
+                await resp.release()
+
+        if unauthorized:
+            # Expire the token (outside the request timeout) so the next API
+            # call re-authenticates.
+            await self.async_invalidate_token(token_used)
+            raise BrinkRefreshError("SignalR negotiate returned HTTP 401")
+
+        connection_token = (
+            negotiate.get("connectionToken") if isinstance(negotiate, dict) else None
+        )
+        if not isinstance(connection_token, str) or not connection_token:
+            raise BrinkRefreshError("SignalR negotiate returned no connection token")
+
+        ws_url = (
+            SIGNALR_HUB_URL.replace("https://", "wss://", 1)
+            + "?"
+            + urlencode({"id": connection_token})
+        )
+        args: list[Any] = [system_id, ids]
+
+        async with asyncio.timeout(hold_seconds + 40):
+            async with self._session.ws_connect(ws_url, headers=headers) as ws:
+                hub = _SignalRReader(ws)
+                await ws.send_str(
+                    json.dumps({"protocol": "json", "version": 1}) + _SIGNALR_RS
+                )
+                handshake = await hub.next_message()
+                if handshake is None or handshake.get("error"):
+                    raise BrinkRefreshError("SignalR handshake was rejected")
+
+                await hub.invoke("1", "SubscribeParameterValues", args)
+                _LOGGER.debug(
+                    "Subscribed to %d parameter value(s) on system %s",
+                    len(ids),
+                    system_id,
+                )
+
+                # Hold the subscription so the cloud reads the unit.
+                deadline = time.monotonic() + hold_seconds
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        async with asyncio.timeout(remaining):
+                            msg = await hub.next_message()
+                    except TimeoutError:
+                        break
+                    if msg is None or msg.get("type") == _SIGNALR_CLOSE:
+                        _LOGGER.debug("SignalR hub closed the connection early")
+                        return
+
+                try:
+                    await hub.invoke("2", "UnSubscribeParameterValues", args)
+                except Exception:  # noqa: BLE001 - closing drops it anyway
+                    _LOGGER.debug("SignalR unsubscribe failed", exc_info=True)
 
     # -------------------------------------------------------------------------
     # OIDC PKCE Authentication
@@ -1155,6 +1330,10 @@ class BrinkAuthError(Exception):
     ) -> None:
         super().__init__(message)
         self.is_credentials_error = is_credentials_error
+
+
+class BrinkRefreshError(Exception):
+    """Raised when the SignalR parameter refresh is rejected by the hub."""
 
 
 class _RefreshTransientError(BrinkAuthError):

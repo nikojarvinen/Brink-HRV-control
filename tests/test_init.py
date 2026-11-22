@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,7 @@ from custom_components.brink_ventilation import (
     PLATFORMS,
     _migrate_device_identifiers,
     _migrate_options,
+    _on_demand_value_ids,
     async_remove_config_entry_device,
     async_setup_entry,
     async_unload_entry,
@@ -567,3 +569,132 @@ async def test_remove_config_entry_device_active(hass: HomeAssistant) -> None:
 
     result = await async_remove_config_entry_device(hass, entry, active_device)
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Daily on-demand parameter refresh (days since filter reset)
+# ---------------------------------------------------------------------------
+
+
+def test_on_demand_value_ids_selects_filter_days_and_pending() -> None:
+    """Filter days is always included; other params only when Pending."""
+    device = {
+        "components": [
+            {
+                "parameters": {
+                    "days_since_filter_reset": {"value_id": 1012, "value_state": 0},
+                    "unknown_21008": {"value_id": 2001, "value_state": 1},
+                    "supply_temp": {"value_id": 1004, "value_state": 0},
+                    "humidity": {"value_id": 1010, "value_state": 5},
+                    "unknown_bool": {"value_id": True, "value_state": 1},
+                    "unknown_none": {"value_id": None, "value_state": 1},
+                    "not_a_dict": "x",
+                }
+            },
+            {"parameters": {"unknown_21008": {"value_id": 2001, "value_state": 1}}},
+            "not_a_component",
+            {"parameters": None},
+        ]
+    }
+    assert _on_demand_value_ids(device) == [1012, 2001]
+    assert _on_demand_value_ids({}) == []
+
+
+async def _setup_with_refresh_capture(
+    hass: HomeAssistant, mock_client: AsyncMock
+) -> tuple[MockConfigEntry, MagicMock, MagicMock]:
+    entry = _make_config_entry()
+    entry.add_to_hass(hass)
+    unsub = MagicMock()
+    track = MagicMock(return_value=unsub)
+    with (
+        patch(
+            "custom_components.brink_ventilation.BrinkHomeCloud",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.brink_ventilation.async_track_time_change", track
+        ),
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    return entry, track, unsub
+
+
+async def test_daily_refresh_scheduled_at_five(hass: HomeAssistant) -> None:
+    """The refresh runs daily at 05:00 local and polls afterwards."""
+    mock_client = _make_mock_client()
+    mock_client.refresh_parameter_values = AsyncMock(return_value=None)
+    entry, track, unsub = await _setup_with_refresh_capture(hass, mock_client)
+
+    track.assert_called_once()
+    kwargs = track.call_args.kwargs
+    assert kwargs["hour"] == 5
+    assert 0 <= kwargs["minute"] < 30
+    assert 0 <= kwargs["second"] < 60
+
+    polls_before = mock_client.get_device_data.await_count
+    track.call_args.args[1](None)
+    await hass.async_block_till_done()
+
+    mock_client.refresh_parameter_values.assert_awaited_once_with(SYSTEM_ID, [1012])
+    assert mock_client.get_device_data.await_count > polls_before
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    unsub.assert_called_once()
+
+
+async def test_daily_refresh_failure_is_logged_not_raised(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed refresh only logs a warning and skips the extra poll."""
+    mock_client = _make_mock_client()
+    mock_client.refresh_parameter_values = AsyncMock(side_effect=TimeoutError())
+    entry, track, _ = await _setup_with_refresh_capture(hass, mock_client)
+
+    polls_before = mock_client.get_device_data.await_count
+    track.call_args.args[1](None)
+    await hass.async_block_till_done()
+
+    mock_client.refresh_parameter_values.assert_awaited_once()
+    assert mock_client.get_device_data.await_count == polls_before
+    assert entry.state is ConfigEntryState.LOADED
+    assert "Could not refresh on-demand values" in caplog.text
+    assert "TimeoutError" in caplog.text
+
+
+async def test_daily_refresh_failure_reports_status_without_traceback(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """HTTP errors log their status; no traceback (URL) is logged."""
+    mock_client = _make_mock_client()
+    err = aiohttp.WSServerHandshakeError(
+        MagicMock(real_url="wss://x/?id=secret-conn"), (), status=403
+    )
+    mock_client.refresh_parameter_values = AsyncMock(side_effect=err)
+    _, track, _ = await _setup_with_refresh_capture(hass, mock_client)
+
+    track.call_args.args[1](None)
+    await hass.async_block_till_done()
+
+    assert "WSServerHandshakeError (HTTP 403)" in caplog.text
+    assert "secret-conn" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+async def test_daily_refresh_minute_is_stable_per_entry(hass: HomeAssistant) -> None:
+    """The same entry always gets the same refresh time."""
+    calls = []
+    for _ in range(2):
+        mock_client = _make_mock_client()
+        mock_client.refresh_parameter_values = AsyncMock(return_value=None)
+        entry, track, _ = await _setup_with_refresh_capture(hass, mock_client)
+        calls.append((entry.entry_id, track.call_args.kwargs))
+        await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+    for entry_id, kwargs in calls:
+        offset = int(hashlib.sha256(entry_id.encode()).hexdigest()[:8], 16)
+        assert kwargs["minute"] == offset % 30
+        assert kwargs["second"] == (offset // 30) % 60

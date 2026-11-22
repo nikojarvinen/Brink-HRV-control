@@ -49,7 +49,7 @@ The integration exposes up to 20 parameters from the Brink Home API as Home Assi
 | Fresh air temperature | °C | Outside air temperature at intake | Enabled |
 | Supply temperature | °C | Air temperature after heat recovery | Enabled |
 | Relative humidity | % | Indoor relative humidity | Disabled |
-| Days since filter reset | days | Counter since last filter replacement | Enabled |
+| Days since filter reset | days | Counter since last filter replacement. The Brink cloud only reads this value from the unit on request, so the integration asks for a fresh value once a day between 05:00 and 05:30 (local time). | Enabled |
 | Remaining duration | minutes | Time remaining in current timed mode (Party, Night, Holiday) | Disabled |
 | Active control status | enum | Current control source (Standby, Manual, Holiday, Party, Auto CO2, Auto eBus, etc.) | Disabled |
 | Bypass valve status | enum | Bypass valve state (Init, Opening, Closing, Open, Closed) | Enabled |

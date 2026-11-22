@@ -84,6 +84,18 @@ EVENT_WRITE_FAILED = f"{DOMAIN}_write_failed"
 # API endpoints
 API_V1_URL = "https://www.brink-home.com/portal/api/v1.1/"
 
+# SignalR hub the Brink web app uses for live parameter values. Subscribing to
+# a parameter makes the cloud fetch a fresh value from the unit; values such as
+# "days since filter reset" are otherwise never refreshed in the REST cache.
+SIGNALR_HUB_URL = "https://www.brink-home.com/portal/client-app"
+
+# valueState reported by the API (enum from the Brink web app):
+# 0 Ok, 1 Pending, 4 Error, 5 OutOfService, 6 NoValidData
+VALUE_STATE_PENDING = 1
+
+# Local time of the daily on-demand parameter refresh
+PARAMETER_REFRESH_HOUR = 5
+
 # OIDC authentication
 OIDC_AUTH_URL = "https://www.brink-home.com/idsrv/connect/authorize"
 OIDC_TOKEN_URL = "https://www.brink-home.com/idsrv/connect/token"

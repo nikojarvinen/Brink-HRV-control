@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -125,6 +126,7 @@ PARAM_FRESH_AIR_TEMP: str = _const_mod.PARAM_FRESH_AIR_TEMP  # type: ignore[attr
 BrinkAuthError = _cloud_mod.BrinkAuthError  # type: ignore[attr-defined]
 BrinkHomeCloud = _cloud_mod.BrinkHomeCloud  # type: ignore[attr-defined]
 _RefreshTransientError = _cloud_mod._RefreshTransientError  # type: ignore[attr-defined]
+BrinkRefreshError = _cloud_mod.BrinkRefreshError  # type: ignore[attr-defined]
 _InputFieldExtractor = _cloud_mod._InputFieldExtractor  # type: ignore[attr-defined]
 _extract_parameters = _cloud_mod._extract_parameters  # type: ignore[attr-defined]
 _is_trusted_url = _cloud_mod._is_trusted_url  # type: ignore[attr-defined]
@@ -3279,3 +3281,217 @@ class TestRedirect308:
             oidc, "https://www.brink-home.com/a", "https://www.brink-home.com/", "st"
         )
         assert code == "cc"
+
+
+# ---------------------------------------------------------------------------
+# SignalR on-demand parameter refresh
+# ---------------------------------------------------------------------------
+
+_RS = "\x1e"
+
+
+class _Frame:
+    def __init__(self, type_: aiohttp.WSMsgType, data: Any = None) -> None:
+        self.type = type_
+        self.data = data
+
+
+class _FakeHubWS:
+    """Minimal SignalR hub stand-in for refresh_parameter_values tests."""
+
+    def __init__(
+        self,
+        *,
+        handshake: str = "{}",
+        subscribe_error: str | None = None,
+        extra_after_handshake: str = "",
+        close_after_subscribe: bool = False,
+    ) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.closed = False
+        self._queue: asyncio.Queue[_Frame] = asyncio.Queue()
+        self._handshake = handshake
+        self._subscribe_error = subscribe_error
+        self._extra = extra_after_handshake
+        self._close_after_subscribe = close_after_subscribe
+
+    async def __aenter__(self) -> "_FakeHubWS":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.closed = True
+
+    async def send_str(self, data: str) -> None:
+        assert data.endswith(_RS)
+        for record in data.split(_RS):
+            if not record:
+                continue
+            msg = json.loads(record)
+            self.sent.append(msg)
+            if "protocol" in msg:
+                # Handshake reply, optionally sharing a frame with a ping
+                self._queue.put_nowait(
+                    _Frame(aiohttp.WSMsgType.TEXT, self._handshake + _RS + self._extra)
+                )
+                continue
+            completion: dict[str, Any] = {
+                "type": 3,
+                "invocationId": msg["invocationId"],
+                "result": None,
+            }
+            if msg["target"] == "SubscribeParameterValues" and self._subscribe_error:
+                completion = {
+                    "type": 3,
+                    "invocationId": msg["invocationId"],
+                    "error": self._subscribe_error,
+                }
+            self._queue.put_nowait(
+                _Frame(aiohttp.WSMsgType.TEXT, json.dumps(completion) + _RS)
+            )
+            if (
+                msg["target"] == "SubscribeParameterValues"
+                and self._close_after_subscribe
+            ):
+                self._queue.put_nowait(_Frame(aiohttp.WSMsgType.CLOSE))
+
+    async def receive(self) -> _Frame:
+        return await self._queue.get()
+
+    def invocations(self) -> list[dict[str, Any]]:
+        return [m for m in self.sent if m.get("type") == 1]
+
+
+def _refresh_client(
+    ws: _FakeHubWS, negotiate: dict[str, Any] | None = None, status: int = 200
+) -> tuple[Any, MagicMock]:
+    session = _make_mock_session()
+    resp = _make_mock_response(
+        status=status,
+        json_data=negotiate
+        if negotiate is not None
+        else {"connectionToken": "conn-tok/1+", "negotiateVersion": 1},
+    )
+    session.post = AsyncMock(return_value=resp)
+    session.ws_connect = MagicMock(return_value=ws)
+    client = BrinkHomeCloud(session, TEST_EMAIL, TEST_PASSWORD)
+    client._access_token = "valid-token"
+    client._token_expiry = time.monotonic() + 3600
+    return client, session
+
+
+class TestRefreshParameterValues:
+    """Tests for refresh_parameter_values (SignalR subscribe/unsubscribe)."""
+
+    @pytest.mark.asyncio
+    async def test_subscribes_holds_and_unsubscribes(self) -> None:
+        ws = _FakeHubWS()
+        client, session = _refresh_client(ws)
+
+        await client.refresh_parameter_values(
+            SYSTEM_ID, [879008, 878990, 879008], hold_seconds=0.05
+        )
+
+        # negotiate with bearer auth
+        url = session.post.call_args.args[0]
+        assert url == "https://www.brink-home.com/portal/client-app/negotiate?negotiateVersion=1"
+        assert session.post.call_args.kwargs["headers"]["Authorization"] == "Bearer valid-token"
+        # websocket with connection id (url-encoded) and bearer header, no token in URL
+        ws_url = session.ws_connect.call_args.args[0]
+        assert ws_url.startswith("wss://www.brink-home.com/portal/client-app?id=")
+        assert "conn-tok%2F1%2B" in ws_url
+        assert "valid-token" not in ws_url
+        assert session.ws_connect.call_args.kwargs["headers"]["Authorization"] == "Bearer valid-token"
+        # handshake, then subscribe + unsubscribe with deduplicated ids
+        assert ws.sent[0] == {"protocol": "json", "version": 1}
+        calls = ws.invocations()
+        assert [c["target"] for c in calls] == [
+            "SubscribeParameterValues",
+            "UnSubscribeParameterValues",
+        ]
+        assert calls[0]["arguments"] == [SYSTEM_ID, [879008, 878990]]
+        assert calls[1]["arguments"] == [SYSTEM_ID, [879008, 878990]]
+        assert ws.closed
+
+    @pytest.mark.asyncio
+    async def test_handles_several_messages_in_one_frame(self) -> None:
+        ws = _FakeHubWS(extra_after_handshake='{"type":6}' + _RS)
+        client, _ = _refresh_client(ws)
+
+        await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=0.05)
+
+        assert [c["target"] for c in ws.invocations()] == [
+            "SubscribeParameterValues",
+            "UnSubscribeParameterValues",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handshake_error_raises(self) -> None:
+        ws = _FakeHubWS(handshake='{"error":"Requested protocol is not available"}')
+        client, _ = _refresh_client(ws)
+
+        with pytest.raises(BrinkRefreshError):
+            await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=0.05)
+        assert ws.invocations() == []
+
+    @pytest.mark.asyncio
+    async def test_subscribe_error_raises(self) -> None:
+        ws = _FakeHubWS(subscribe_error="Unauthorized")
+        client, _ = _refresh_client(ws)
+
+        with pytest.raises(BrinkRefreshError):
+            await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=0.05)
+
+    @pytest.mark.asyncio
+    async def test_hub_closing_during_hold_returns_quietly(self) -> None:
+        ws = _FakeHubWS(close_after_subscribe=True)
+        client, _ = _refresh_client(ws)
+
+        await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=5)
+
+        assert [c["target"] for c in ws.invocations()] == ["SubscribeParameterValues"]
+
+    @pytest.mark.asyncio
+    async def test_negotiate_401_invalidates_token(self) -> None:
+        ws = _FakeHubWS()
+        client, session = _refresh_client(ws, status=401)
+        resp = session.post.return_value
+
+        with pytest.raises(BrinkRefreshError, match="401"):
+            await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=0.05)
+        assert client._token_expiry == 0.0
+        session.ws_connect.assert_not_called()
+        resp.release.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_connection_token_raises(self) -> None:
+        ws = _FakeHubWS()
+        client, session = _refresh_client(ws, negotiate={"negotiateVersion": 1})
+
+        with pytest.raises(BrinkRefreshError):
+            await client.refresh_parameter_values(SYSTEM_ID, [1], hold_seconds=0.05)
+        session.ws_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_ids_makes_no_requests(self) -> None:
+        ws = _FakeHubWS()
+        client, session = _refresh_client(ws)
+
+        await client.refresh_parameter_values(SYSTEM_ID, [])
+
+        session.post.assert_not_called()
+        session.ws_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("system_id", "value_ids"),
+        [("13090", [1]), (True, [1]), (SYSTEM_ID, ["1"]), (SYSTEM_ID, [True])],
+    )
+    async def test_rejects_non_integer_ids(
+        self, system_id: Any, value_ids: list[Any]
+    ) -> None:
+        ws = _FakeHubWS()
+        client, session = _refresh_client(ws)
+
+        with pytest.raises(ValueError):
+            await client.refresh_parameter_values(system_id, value_ids)
+        session.post.assert_not_called()
