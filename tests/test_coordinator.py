@@ -81,6 +81,11 @@ def _make_mock_client(
     client = AsyncMock()
     client.login = AsyncMock(side_effect=login_side_effect)
     client.async_invalidate_token = AsyncMock(return_value=None)
+    # The coordinator's internet check uses the client's session directly.
+    # Make it fail like an offline network instead of returning an
+    # un-awaited AsyncMock coroutine.
+    client._session = MagicMock()
+    client._session.head = MagicMock(side_effect=aiohttp.ClientError("offline"))
 
     if get_systems_side_effect is not None:
         client.get_systems = AsyncMock(side_effect=get_systems_side_effect)

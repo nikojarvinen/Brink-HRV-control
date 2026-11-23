@@ -1,7 +1,6 @@
 """Fixtures for Brink HRV Control tests."""
 from __future__ import annotations
 
-import asyncio
 import sys
 from collections.abc import Generator
 from copy import deepcopy
@@ -40,9 +39,6 @@ if sys.platform == "win32":
         _socket.socket = WinGuardedSocket  # type: ignore[misc]
 
     pytest_socket.disable_socket = _win_disable_socket
-
-    # Also force SelectorEventLoop to avoid ProactorEventLoop issues.
-    asyncio.get_event_loop_policy()._loop_factory = asyncio.SelectorEventLoop  # type: ignore[attr-defined]
 
     pass  # pycares/aiodns thread workaround is handled by the fixture below
 
