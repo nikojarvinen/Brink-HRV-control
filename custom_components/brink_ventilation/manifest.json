@@ -4,7 +4,7 @@
   "codeowners": ["@nikojarvinen"],
   "config_flow": true,
   "documentation": "https://github.com/nikojarvinen/Brink-HRV-control/blob/master/README.md",
-  "homeassistant": "2024.12.0",
+  "homeassistant": "2026.7.0",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/nikojarvinen/Brink-HRV-control/issues",
   "requirements": [],

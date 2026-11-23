@@ -117,11 +117,15 @@ async def test_user_flow_invalid_auth(hass: HomeAssistant) -> None:
     assert result["errors"] == {"base": "invalid_auth"}
 
     # Retry with correct credentials
-    with _patch_test_credentials():
+    with (
+        _patch_test_credentials(),
+        patch("custom_components.brink_ventilation.async_setup_entry", return_value=True),
+    ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {CONF_USERNAME: TEST_EMAIL, CONF_PASSWORD: TEST_PASSWORD},
         )
+        await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
@@ -216,11 +220,15 @@ async def test_user_flow_connection_error(hass: HomeAssistant) -> None:
     assert result["errors"] == {"base": "cannot_connect"}
 
     # Retry successfully
-    with _patch_test_credentials():
+    with (
+        _patch_test_credentials(),
+        patch("custom_components.brink_ventilation.async_setup_entry", return_value=True),
+    ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             {CONF_USERNAME: TEST_EMAIL, CONF_PASSWORD: TEST_PASSWORD},
         )
+        await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
 
